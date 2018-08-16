@@ -1606,7 +1606,9 @@ func ConfigFileToMonitoredDatabases(configFilePath string) ([]MonitoredDatabase,
 	for _, v := range c {
 		log.Debugf("Found monitoring config entry: %#v", v)
 		if v.IsEnabled {
-			v.Group = "default"
+			if v.Group == "" {
+				v.Group = "default"
+			}
 			hostList = append(hostList, v)
 		}
 	}

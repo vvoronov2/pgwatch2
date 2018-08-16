@@ -8,6 +8,7 @@
   sslmode: disable
   stmt_timeout: 5
   is_superuser: true
+  group: default
   preset_metrics: minimal
   custom_metrics:    # if both preset and custom are specified, custom wins
   dbname_include_pattern:
