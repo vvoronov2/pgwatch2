@@ -28,6 +28,7 @@ import (
 
 type MonitoredDatabase struct {
 	DBUniqueName         string `yaml:"unique_name"`
+	Group                string
 	Host                 string
 	Port                 string
 	DBName               string
@@ -277,7 +278,7 @@ func DBExecReadByDbUniqueName(dbUnique string, useCache bool, sql string, args .
 func GetAllActiveHostsFromConfigDB() ([](map[string]interface{}), error) {
 	sql := `
 		select
-		  md_unique_name, md_dbtype, md_hostname, md_port, md_dbname, md_user, coalesce(md_password, '') as md_password,
+		  md_unique_name, md_group, md_dbtype, md_hostname, md_port, md_dbname, md_user, coalesce(md_password, '') as md_password,
 		  coalesce(pc_config, md_config)::text as md_config, md_statement_timeout_seconds, md_sslmode, md_is_superuser,
 		  coalesce(md_include_pattern, '') as md_include_pattern, coalesce(md_exclude_pattern, '') as md_exclude_pattern,
 		  coalesce(md_custom_tags::text, '{}') as md_custom_tags
@@ -301,11 +302,33 @@ func GetAllActiveHostsFromConfigDB() ([](map[string]interface{}), error) {
 func GetMonitoredDatabasesFromConfigDB() ([]MonitoredDatabase, error) {
 	monitoredDBs := make([]MonitoredDatabase, 0)
 	activeHostData, err := GetAllActiveHostsFromConfigDB()
+	groups := strings.Split(opts.Group, ",")
+	skippedEntries := 0
+
 	if err != nil {
 		log.Errorf("Failed to read monitoring config from DB: %s", err)
 		return monitoredDBs, err
 	}
+
 	for _, row := range activeHostData {
+
+		if len(opts.Group) > 0 { // filter out rows with non-matching groups
+			matched := false
+			for _, g := range groups {
+				if row["md_group"].(string) == g {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				skippedEntries += 1
+				continue
+			}
+		}
+		if skippedEntries > 0 {
+			log.Infof("Filtered out %d config entries based on --groups input", skippedEntries)
+		}
+
 		md := MonitoredDatabase{
 			DBUniqueName:         row["md_unique_name"].(string),
 			Host:                 row["md_hostname"].(string),
@@ -319,6 +342,7 @@ func GetMonitoredDatabasesFromConfigDB() ([]MonitoredDatabase, error) {
 			DBType:               row["md_dbtype"].(string),
 			DBNameIncludePattern: row["md_include_pattern"].(string),
 			DBNameExcludePattern: row["md_exclude_pattern"].(string),
+			Group:                row["md_group"].(string),
 			CustomTags:           jsonTextToStringMap(row["md_custom_tags"].(string))}
 
 		if md.DBType == "postgres-continuous-discovery" {
@@ -573,8 +597,8 @@ func ProcessRetryQueue(data_source, conn_str, conn_ident string, retry_queue *li
 		if err != nil {
 			if data_source == DATASTORE_INFLUX && strings.Contains(err.Error(), "unable to parse") {
 				if len(msg) == 1 { // can only pinpoint faulty input data without batching
-					log.Error(fmt.Sprintf("Dropping %d metric [%s:%s] as Influx is unable to parse the data: %s",
-						msg[0].DBUniqueName, msg[0].MetricName, msg[0].Data)) // ignore data points consisting of anything else than strings and floats
+					log.Errorf("Dropping metric [%s:%s] as Influx is unable to parse the data: %v",
+						msg[0].DBUniqueName, msg[0].MetricName, msg[0].Data) // ignore data points consisting of anything else than strings and floats
 				} else {
 					log.Errorf("Dropping %d metric-sets as Influx is unable to parse the data: %s", len(msg), err)
 				}
@@ -1582,6 +1606,7 @@ func ConfigFileToMonitoredDatabases(configFilePath string) ([]MonitoredDatabase,
 	for _, v := range c {
 		log.Debugf("Found monitoring config entry: %#v", v)
 		if v.IsEnabled {
+			v.Group = "default"
 			hostList = append(hostList, v)
 		}
 	}
@@ -1711,6 +1736,23 @@ func GetMonitoredDatabasesFromMonitoringConfig(mc []MonitoredDatabase) []Monitor
 	return md
 }
 
+func FilterMonitoredDatabasesByGroup(monitoredDBs []MonitoredDatabase, group string) ([]MonitoredDatabase, int) {
+	ret := make([]MonitoredDatabase, 0)
+	groups := strings.Split(group, ",")
+
+	for _, md := range monitoredDBs {
+		// matched := false
+		for _, g := range groups {
+			if md.Group == g {
+				ret = append(ret, md)
+				break
+			}
+		}
+	}
+
+	return ret, len(monitoredDBs) - len(ret)
+}
+
 type Options struct {
 	// Slice of bool will append 'true' each time the option
 	// is encountered (can be set multiple times, like -vvv)
@@ -1720,6 +1762,7 @@ type Options struct {
 	Dbname              string `short:"d" long:"dbname" description:"PG config DB dbname" default:"pgwatch2" env:"PW2_PGDATABASE"`
 	User                string `short:"u" long:"user" description:"PG config DB user" default:"pgwatch2" env:"PW2_PGUSER"`
 	Password            string `long:"password" description:"PG config DB password" env:"PW2_PGPASSWORD"`
+	Group               string `long:"group" description:"Group (or groups, comma separated) for filtering which DBs to monitor. By default all are monitored" env:"PW2_GROUP"`
 	Datastore           string `long:"datastore" description:"[influx|graphite]" default:"influx" env:"PW2_DATASTORE"`
 	InfluxHost          string `long:"ihost" description:"Influx host" default:"localhost" env:"PW2_IHOST"`
 	InfluxPort          string `long:"iport" description:"Influx port" default:"8086" env:"PW2_IPORT"`
@@ -1948,6 +1991,11 @@ func main() {
 				mc, err := ReadMonitoringConfigFromFileOrFolder(opts.Config)
 				if err == nil {
 					log.Debugf("Found %d monitoring config entries", len(mc))
+					if len(opts.Group) > 0 {
+						var removed_count int
+						mc, removed_count = FilterMonitoredDatabasesByGroup(mc, opts.Group)
+						log.Infof("Filtered out %d config entries based on --groups=%s", removed_count, opts.Group)
+					}
 					monitored_dbs = GetMonitoredDatabasesFromMonitoringConfig(mc)
 					log.Debugf("Found %d databases to monitor from %d config items...", len(monitored_dbs), len(mc))
 				} else {
