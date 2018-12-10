@@ -81,10 +81,11 @@ type MetricStoreMessage struct {
 }
 
 type MetricStoreMessagePostgres struct {
-	Time   time.Time
-	DBName string
-	Metric string
-	Data   map[string]interface{}
+	Time    time.Time
+	DBName  string
+	Metric  string
+	Data    map[string]interface{}
+	TagData map[string]interface{}
 }
 
 type ChangeDetectionResults struct { // for passing around DDL/index/config change detection results
@@ -583,13 +584,14 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 			var epoch_time time.Time
 			var epoch_ns int64
 
-			tags_and_fields := make(map[string]interface{})
+			tags := make(map[string]interface{})
+			fields := make(map[string]interface{})
 
 			total_rows += 1
 
 			if msg.CustomTags != nil {
 				for k, v := range msg.CustomTags {
-					tags_and_fields[k] = fmt.Sprintf("%v", v)
+					tags[k] = fmt.Sprintf("%v", v)
 				}
 			}
 
@@ -601,9 +603,9 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 					epoch_ns = v.(int64)
 				} else if strings.HasPrefix(k, "tag_") {
 					tag := k[4:]
-					tags_and_fields[tag] = fmt.Sprintf("%v", v)
+					tags[tag] = fmt.Sprintf("%v", v)
 				} else {
-					tags_and_fields[k] = v
+					fields[k] = v
 				}
 			}
 
@@ -618,7 +620,7 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 			}
 
 			metricsToStore = append(metricsToStore, MetricStoreMessagePostgres{Time: epoch_time, DBName: msg.DBUniqueName,
-				Metric: msg.MetricName, Data: tags_and_fields})
+				Metric: msg.MetricName, Data: fields, TagData: tags})
 			rows_batched += 1
 		}
 	}
@@ -632,7 +634,7 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 		return err
 	}
 
-	stmt, err := txn.Prepare(pq.CopyIn("metrics", "time", "dbname", "metric", "data"))
+	stmt, err := txn.Prepare(pq.CopyIn("metrics", "time", "dbname", "metric", "data", "tag_data"))
 	if err != nil {
 		log.Error("Could not prepare COPY to 'metrics' table:", err)
 		return err
@@ -644,10 +646,24 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 			log.Errorf("Skipping 1 metric for [%s:%s] due to JSON conversion error: %s", m.DBName, m.Metric, err)
 			continue
 		}
-		_, err = stmt.Exec(m.Time, m.DBName, m.Metric, string(jsonBytes))
-		if err != nil {
-			log.Error("Formatting 1 metric to COPY format failed: ", err)
-			continue
+
+		if len(m.TagData) > 0 {
+			jsonBytesTags, err := mapToJson(m.TagData)
+			if err != nil {
+				log.Errorf("Skipping 1 metric for [%s:%s] due to JSON conversion error: %s", m.DBName, m.Metric, err)
+				goto stmt_close
+			}
+			_, err = stmt.Exec(m.Time, m.DBName, m.Metric, string(jsonBytes), nil)
+			if err != nil {
+				log.Error("Formatting 1 metric to COPY format failed: ", jsonBytesTags)
+				goto stmt_close
+			}
+		} else {
+			_, err = stmt.Exec(m.Time, m.DBName, m.Metric, string(jsonBytes), nil)
+			if err != nil {
+				log.Error("Formatting 1 metric to COPY format failed: ", err)
+				goto stmt_close
+			}
 		}
 	}
 
@@ -655,6 +671,7 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 	if err != nil {
 		log.Error("COPY to Postgres failed:", err)
 	}
+stmt_close:
 	err = stmt.Close()
 	if err != nil {
 		log.Error("stmt.Close() failed:", err)
