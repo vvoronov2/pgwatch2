@@ -653,7 +653,7 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 				log.Errorf("Skipping 1 metric for [%s:%s] due to JSON conversion error: %s", m.DBName, m.Metric, err)
 				goto stmt_close
 			}
-			_, err = stmt.Exec(m.Time, m.DBName, m.Metric, string(jsonBytes), nil)
+			_, err = stmt.Exec(m.Time, m.DBName, m.Metric, string(jsonBytes), string(jsonBytesTags))
 			if err != nil {
 				log.Error("Formatting 1 metric to COPY format failed: ", jsonBytesTags)
 				goto stmt_close
