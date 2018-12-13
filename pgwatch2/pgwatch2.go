@@ -108,6 +108,8 @@ const PG_CONN_RECYCLE_SECONDS = 1800                // applies for monitored nod
 const APPLICATION_NAME = "pgwatch2"                 // will be set on all opened PG connections for informative purposes
 const TABLE_BLOAT_APPROX_TIMEOUT_MIN_SECONDS = 1800 // special statement timeout override for pgstatuple_approx metrics as they can be slow (seq. scans)
 const MAX_PG_CONNECTIONS_PER_MONITORED_DB = 2       // for limiting max concurrent queries on a single DB, sql.DB maxPoolSize cannot be fully trusted
+const GATHERER_STATUS_START = "START"
+const GATHERER_STATUS_STOP = "STOP"
 
 var configDb *sqlx.DB
 var graphiteConnection *graphite.Graphite
@@ -1354,53 +1356,45 @@ func FetchAndStore(msg MetricFetchMessage, host_state map[string]map[string]stri
 func MetricGathererLoop(dbUniqueName, dbType, metricName string, config_map map[string]float64, control_ch <-chan ControlMessage, store_ch chan<- []MetricStoreMessage) {
 	config := config_map
 	interval := config[metricName]
-	running := true
 	ticker := time.NewTicker(time.Millisecond * time.Duration(interval*1000))
 	host_state := make(map[string]map[string]string)
 	last_error_notification_time := time.Now()
 	failed_fetches := 0
 
 	for {
-		if running {
-			t1 := time.Now()
-			_, err := FetchAndStore(
-				MetricFetchMessage{DBUniqueName: dbUniqueName, MetricName: metricName, DBType: dbType},
-				host_state,
-				store_ch)
-			t2 := time.Now()
-			if err != nil {
-				if last_error_notification_time.Add(time.Second * time.Duration(600)).Before(time.Now()) {
-					log.Errorf("Total failed fetches for [%s:%s]: %d", failed_fetches)
-					last_error_notification_time = time.Now()
-				}
-				failed_fetches += 1
-			}
 
-			if t2.Sub(t1) > (time.Second * time.Duration(interval)) {
-				log.Warningf("Total fetching time of %v bigger than %vs interval for [%s:%s]", t2.Sub(t1), interval, dbUniqueName, metricName)
+		t1 := time.Now()
+		_, err := FetchAndStore(
+			MetricFetchMessage{DBUniqueName: dbUniqueName, MetricName: metricName, DBType: dbType},
+			host_state,
+			store_ch)
+		t2 := time.Now()
+		if err != nil {
+			if last_error_notification_time.Add(time.Second * time.Duration(600)).Before(time.Now()) {
+				log.Errorf("Total failed fetches for [%s:%s]: %d", failed_fetches)
+				last_error_notification_time = time.Now()
 			}
+			failed_fetches += 1
+		}
+
+		if t2.Sub(t1) > (time.Second * time.Duration(interval)) {
+			log.Warningf("Total fetching time of %v bigger than %vs interval for [%s:%s]", t2.Sub(t1), interval, dbUniqueName, metricName)
 		}
 
 		select {
 		case msg := <-control_ch:
 			log.Debug("got control msg", dbUniqueName, metricName, msg)
-			if msg.Action == "START" {
+			if msg.Action == GATHERER_STATUS_START {
 				config = msg.Config
 				interval = config[metricName]
 				if ticker != nil {
 					ticker.Stop()
 				}
 				ticker = time.NewTicker(time.Millisecond * time.Duration(interval*1000))
-				if !running {
-					running = true
-					log.Debug("started MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
-				}
-			} else if msg.Action == "STOP" && running {
+				log.Debug("started MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
+			} else if msg.Action == GATHERER_STATUS_STOP {
 				log.Debug("exiting MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
 				return
-			} else if msg.Action == "PAUSE" && running {
-				log.Debug("pausing MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
-				running = false
 			}
 		case <-ticker.C:
 			log.Debugf("MetricGathererLoop for [%s:%s] slept for %s", dbUniqueName, metricName, time.Second*time.Duration(interval))
