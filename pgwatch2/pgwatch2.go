@@ -242,19 +242,20 @@ func DBExecRead(conn *sqlx.DB, host_ident, sql string, args ...interface{}) ([](
 	return ret, err
 }
 
-func DBExecReadByDbUniqueName(dbUnique, metricName string, useCache bool, sql string, args ...interface{}) ([](map[string]interface{}), error) {
+func DBExecReadByDbUniqueName(dbUnique, metricName string, useCache bool, sql string, args ...interface{}) ([](map[string]interface{}), error, time.Duration) {
 	var conn *sqlx.DB
 	var exists bool
 	var md MonitoredDatabase
 	var err error
+	var duration time.Duration
 
 	if strings.TrimSpace(sql) == "" {
-		return nil, errors.New("empty SQL")
+		return nil, errors.New("empty SQL"), duration
 	}
 
 	md, err = GetMonitoredDatabaseByUniqueName(dbUnique)
 	if err != nil {
-		return nil, err
+		return nil, err, duration
 	}
 
 	db_conn_limiting_channel_lock.RLock()
@@ -277,7 +278,7 @@ func DBExecReadByDbUniqueName(dbUnique, metricName string, useCache bool, sql st
 
 		conn, err = GetPostgresDBConnection(opts.AdHocConnString, md.Host, md.Port, md.DBName, md.User, md.Password, md.SslMode)
 		if err != nil {
-			return nil, err
+			return nil, err, duration
 		}
 		defer conn.Close()
 
@@ -288,7 +289,7 @@ func DBExecReadByDbUniqueName(dbUnique, metricName string, useCache bool, sql st
 			}
 			_, err = DBExecRead(conn, dbUnique, fmt.Sprintf("SET statement_timeout TO '%ds'", stmtTimeout))
 			if err != nil {
-				return nil, err
+				return nil, err, duration
 			}
 		}
 	} else {
@@ -308,13 +309,13 @@ func DBExecReadByDbUniqueName(dbUnique, metricName string, useCache bool, sql st
 
 			conn, err = GetPostgresDBConnection(opts.AdHocConnString, md.Host, md.Port, md.DBName, md.User, md.Password, md.SslMode)
 			if err != nil {
-				return nil, err
+				return nil, err, duration
 			}
 			if !adHocMode && md.DBType == "postgres" {
 				log.Debugf("Setting statement_timeout to %ds for the new PG connection to %s...", md.StmtTimeout, dbUnique)
 				_, err = DBExecRead(conn, dbUnique, fmt.Sprintf("SET statement_timeout TO '%ds'", md.StmtTimeout))
 				if err != nil {
-					return nil, err
+					return nil, err, duration
 				}
 			}
 
@@ -332,22 +333,23 @@ func DBExecReadByDbUniqueName(dbUnique, metricName string, useCache bool, sql st
 		if md.DBType == "postgres" && (metricName == "table_bloat_approx_summary" || metricName == "table_bloat_approx_stattuple") && md.StmtTimeout < TABLE_BLOAT_APPROX_TIMEOUT_MIN_SECONDS {
 			_, err = DBExecRead(conn, dbUnique, fmt.Sprintf("SET statement_timeout TO '%ds'", TABLE_BLOAT_APPROX_TIMEOUT_MIN_SECONDS))
 			if err != nil {
-				return nil, err
+				return nil, err, duration
 			}
 		}
 	}
-
+	t1 := time.Now()
 	data, err := DBExecRead(conn, dbUnique, sql, args...)
+	t2 := time.Now()
 
 	if err == nil && md.DBType == "postgres" && useCache && (metricName == "table_bloat_approx_summary" || metricName == "table_bloat_approx_stattuple") {
 		// restore general statement timeout
 		_, err = DBExecRead(conn, dbUnique, fmt.Sprintf("SET statement_timeout TO '%ds'", md.StmtTimeout))
 		if err != nil {
-			return nil, err
+			return nil, err, t2.Sub(t1)
 		}
 	}
 
-	return data, err
+	return data, err, t2.Sub(t1)
 }
 
 func GetAllActiveHostsFromConfigDB() ([](map[string]interface{}), error) {
@@ -534,11 +536,11 @@ retry:
 	t_diff := time.Now().Sub(t1)
 	if err == nil {
 		if len(storeMessages) == 1 {
-			log.Info(fmt.Sprintf("wrote %d/%d rows to InfluxDB %s for [%s:%s] in %dus", rows_batched, total_rows,
-				conn_id, storeMessages[0].DBUniqueName, storeMessages[0].MetricName, t_diff.Nanoseconds()/1000))
+			log.Infof("wrote %d/%d rows to InfluxDB %s for [%s:%s] in %.1f ms", rows_batched, total_rows,
+				conn_id, storeMessages[0].DBUniqueName, storeMessages[0].MetricName, float64(t_diff.Nanoseconds())/1000000.0)
 		} else {
-			log.Info(fmt.Sprintf("wrote %d/%d rows from %d metric sets to InfluxDB %s in %dus", rows_batched, total_rows,
-				len(storeMessages), conn_id, t_diff.Nanoseconds()/1000))
+			log.Infof("wrote %d/%d rows from %d metric sets to InfluxDB %s in %.1f ms", rows_batched, total_rows,
+				len(storeMessages), conn_id, float64(t_diff.Nanoseconds())/1000000.0)
 		}
 		lastSuccessfulDatastoreWriteTime = t1
 	}
@@ -856,7 +858,7 @@ func DBGetPGVersion(dbUnique string) (DBVersionMapEntry, error) {
 		return ver, nil
 	} else {
 		log.Debug("determining DB version for", dbUnique)
-		data, err := DBExecReadByDbUniqueName(dbUnique, "", useConnPooling, sql)
+		data, err, _ := DBExecReadByDbUniqueName(dbUnique, "", useConnPooling, sql)
 		if err != nil {
 			log.Error("DBGetPGVersion failed", err)
 			return ver, err
@@ -939,7 +941,7 @@ func DetectSprocChanges(dbUnique string, db_pg_version decimal.Decimal, storage_
 		return change_counts
 	}
 
-	data, err := DBExecReadByDbUniqueName(dbUnique, "sproc_hashes", useConnPooling, sql)
+	data, err, _ := DBExecReadByDbUniqueName(dbUnique, "sproc_hashes", useConnPooling, sql)
 	if err != nil {
 		log.Error("could not read table_hashes from monitored host: ", dbUnique, ", err:", err)
 		return change_counts
@@ -1022,7 +1024,7 @@ func DetectTableChanges(dbUnique string, db_pg_version decimal.Decimal, storage_
 		return change_counts
 	}
 
-	data, err := DBExecReadByDbUniqueName(dbUnique, "table_hashes", useConnPooling, sql)
+	data, err, _ := DBExecReadByDbUniqueName(dbUnique, "table_hashes", useConnPooling, sql)
 	if err != nil {
 		log.Error("could not read table_hashes from monitored host:", dbUnique, ", err:", err)
 		return change_counts
@@ -1105,7 +1107,7 @@ func DetectIndexChanges(dbUnique string, db_pg_version decimal.Decimal, storage_
 		return change_counts
 	}
 
-	data, err := DBExecReadByDbUniqueName(dbUnique, "index_hashes", useConnPooling, sql)
+	data, err, _ := DBExecReadByDbUniqueName(dbUnique, "index_hashes", useConnPooling, sql)
 	if err != nil {
 		log.Error("could not read index_hashes from monitored host:", dbUnique, ", err:", err)
 		return change_counts
@@ -1186,7 +1188,7 @@ func DetectConfigurationChanges(dbUnique string, db_pg_version decimal.Decimal, 
 		return change_counts
 	}
 
-	data, err := DBExecReadByDbUniqueName(dbUnique, "configuration_hashes", useConnPooling, sql)
+	data, err, _ := DBExecReadByDbUniqueName(dbUnique, "configuration_hashes", useConnPooling, sql)
 	if err != nil {
 		log.Error("could not read configuration_hashes from monitored host:", dbUnique, ", err:", err)
 		return change_counts
@@ -1308,9 +1310,7 @@ func MetricsFetcher(msg MetricFetchMessage, host_state map[string]map[string]str
 		CheckForPGObjectChangesAndStore(msg.DBUniqueName, db_pg_version, storage_ch, host_state)
 	} else {
 
-		t1 := time.Now().UnixNano()
-		data, err := DBExecReadByDbUniqueName(msg.DBUniqueName, msg.MetricName, useConnPooling, sql)
-		t2 := time.Now().UnixNano()
+		data, err, duration := DBExecReadByDbUniqueName(msg.DBUniqueName, msg.MetricName, useConnPooling, sql)
 
 		if err != nil {
 			if strings.Contains(err.Error(), "empty SQL") { // empty / dummy SQL is used for metrics that became available at a certain version
@@ -1335,7 +1335,7 @@ func MetricsFetcher(msg MetricFetchMessage, host_state map[string]map[string]str
 				return len(data), err
 			}
 
-			log.Info(fmt.Sprintf("fetched %d rows for [%s:%s] in %dus", len(data), msg.DBUniqueName, msg.MetricName, (t2-t1)/1000))
+			log.Infof("fetched %d rows for [%s:%s] in %.1f ms", len(data), msg.DBUniqueName, msg.MetricName, float64(duration.Nanoseconds())/1000000)
 			if msg.MetricName == "pgbouncer_stats" { // clean unwanted pgbouncer pool stats here as not possible in SQL
 				data = FilterPgbouncerData(data, md.DBName)
 			}
@@ -1543,7 +1543,7 @@ retry:
 func DoesFunctionExists(dbUnique, functionName string) bool {
 	log.Debug("Checking for function existance", dbUnique, functionName)
 	sql := fmt.Sprintf("select 1 from pg_proc join pg_namespace n on pronamespace = n.oid where proname = '%s' and n.nspname = 'public'", functionName)
-	data, err := DBExecReadByDbUniqueName(dbUnique, "", useConnPooling, sql)
+	data, err, _ := DBExecReadByDbUniqueName(dbUnique, "", useConnPooling, sql)
 	if err != nil {
 		log.Error("Failed to check for function existance", dbUnique, functionName, err)
 		return false
@@ -1580,7 +1580,7 @@ func TryCreateMetricsFetchingHelpers(dbUnique string) error {
 					log.Warning("Could not find query text for", dbUnique, helperName)
 					continue
 				}
-				_, err = DBExecReadByDbUniqueName(dbUnique, "", useConnPooling, sql)
+				_, err, _ = DBExecReadByDbUniqueName(dbUnique, "", useConnPooling, sql)
 				if err != nil {
 					log.Warning("Failed to create a metric fetching helper for", dbUnique, helperName)
 					log.Warning(err)
@@ -1608,7 +1608,7 @@ func TryCreateMetricsFetchingHelpers(dbUnique string) error {
 					log.Warning("Could not find query text for", dbUnique, metric)
 					continue
 				}
-				_, err = DBExecReadByDbUniqueName(dbUnique, "", true, sql)
+				_, err, _ = DBExecReadByDbUniqueName(dbUnique, "", true, sql)
 				if err != nil {
 					log.Warning("Failed to create a metric fetching helper for", dbUnique, metric)
 					log.Warning(err)
@@ -2272,7 +2272,7 @@ func main() {
 				if db_type == "postgres" {
 					ver, err = DBGetPGVersion(db_unique)
 				} else if db_type == "pgbouncer" {
-					_, err = DBExecReadByDbUniqueName(db_unique, "", false, "show version")
+					_, err, _ = DBExecReadByDbUniqueName(db_unique, "", false, "show version")
 				}
 				if err != nil {
 					log.Errorf("could not start metric gathering for DB \"%s\" due to connection problem: %s", db_unique, err)
