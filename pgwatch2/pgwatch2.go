@@ -122,11 +122,6 @@ var monitored_db_cache map[string]MonitoredDatabase
 var monitored_db_cache_lock sync.RWMutex
 var monitored_db_conn_cache map[string]*sqlx.DB = make(map[string]*sqlx.DB)
 var monitored_db_conn_cache_lock = sync.RWMutex{}
-var metric_fetching_channels = make(map[string]bool) // [db1unique]=true
-var metric_fetching_channels_lock = sync.RWMutex{}
-
-//var actively_fetched_metrics_per_db = make(map[string]string) // to allow only one concurrent metric fetching for a single metric definition per DB
-//var actively_fetched_metrics_per_db_lock = sync.RWMutex{}
 var db_conn_limiting_channel = make(map[string](chan bool))
 var db_conn_limiting_channel_lock = sync.RWMutex{}
 var last_sql_fetch_error sync.Map
@@ -842,7 +837,7 @@ func MetricsPersister(data_store string, storage_ch <-chan []MetricStoreMessage)
 	}
 }
 
-func DBGetPGVersion(dbUnique string) (decimal.Decimal, error) {
+func DBGetPGVersion(dbUnique string) (DBVersionMapEntry, error) {
 	var ver DBVersionMapEntry
 	var ok bool
 	sql := `
@@ -858,24 +853,23 @@ func DBGetPGVersion(dbUnique string) (decimal.Decimal, error) {
 
 	if ok && ver.LastCheckedOn.After(time.Now().Add(time.Minute*-2)) { // use cached version for 2 min
 		log.Debug(fmt.Sprintf("using cached postgres version %s for %s", ver.Version.String(), dbUnique))
-		return ver.Version, nil
+		return ver, nil
 	} else {
 		log.Debug("determining DB version for", dbUnique)
 		data, err := DBExecReadByDbUniqueName(dbUnique, "", useConnPooling, sql)
 		if err != nil {
 			log.Error("DBGetPGVersion failed", err)
-			return ver.Version, err
+			return ver, err
 		}
 		ver.Version, _ = decimal.NewFromString(data[0]["ver"].(string))
 		ver.IsInRecovery = data[0]["pg_is_in_recovery"].(bool)
 		ver.LastCheckedOn = time.Now()
-		log.Info(fmt.Sprintf("%s is on version %s (in recovery: %v)", dbUnique, ver.Version, ver.IsInRecovery))
 
 		db_pg_version_map_lock.Lock()
 		db_pg_version_map[dbUnique] = ver
 		db_pg_version_map_lock.Unlock()
 	}
-	return ver.Version, nil
+	return ver, nil
 }
 
 // Need to define a sort interface as Go doesn't have support for Numeric/Decimal
@@ -1288,11 +1282,12 @@ func MetricsFetcher(msg MetricFetchMessage, host_state map[string]map[string]str
 	var err error
 
 	if msg.DBType == "postgres" {
-		db_pg_version, err = DBGetPGVersion(msg.DBUniqueName)
+		ver, err := DBGetPGVersion(msg.DBUniqueName)
 		if err != nil {
 			log.Error("failed to fetch pg version for ", msg.DBUniqueName, msg.MetricName, err)
 			return 0, err
 		}
+		db_pg_version = ver.Version
 	} else if msg.DBType == "pgbouncer" {
 		db_pg_version = decimal.Decimal{} // version is 0.0 for all pgbouncer sql per convention
 		// as surprisingly pgbouncer 'show version' outputs it as 'NOTICE'
@@ -1580,7 +1575,7 @@ func TryCreateMetricsFetchingHelpers(dbUnique string) error {
 			if !DoesFunctionExists(dbUnique, helperName) {
 
 				log.Debug("Trying to create metric fetching helpers for", dbUnique, helperName)
-				sql, err := GetSQLForMetricPGVersion(helperName, db_pg_version, helpers)
+				sql, err := GetSQLForMetricPGVersion(helperName, db_pg_version.Version, helpers)
 				if err != nil {
 					log.Warning("Could not find query text for", dbUnique, helperName)
 					continue
@@ -1608,7 +1603,7 @@ func TryCreateMetricsFetchingHelpers(dbUnique string) error {
 			if !DoesFunctionExists(dbUnique, metric) {
 
 				log.Debug("Trying to create metric fetching helpers for", dbUnique, metric)
-				sql, err := GetSQLForMetricPGVersion(metric, db_pg_version, nil)
+				sql, err := GetSQLForMetricPGVersion(metric, db_pg_version.Version, nil)
 				if err != nil {
 					log.Warning("Could not find query text for", dbUnique, metric)
 					continue
@@ -2255,25 +2250,27 @@ func main() {
 			db_unique := host.DBUniqueName
 			db_type := host.DBType
 
-			metric_fetching_channels_lock.RLock()
-			_, exists := metric_fetching_channels[db_unique]
-			metric_fetching_channels_lock.RUnlock()
+			db_conn_limiting_channel_lock.RLock()
+			_, exists := db_conn_limiting_channel[db_unique]
+			db_conn_limiting_channel_lock.RUnlock()
+
 			if !exists {
 				var err error
+				var ver DBVersionMapEntry
 
 				log.Info(fmt.Sprintf("new host \"%s\" found, checking connectivity...", db_unique))
 				db_conn_limiting_channel_lock.Lock()
 				db_conn_limiting_channel[db_unique] = make(chan bool, MAX_PG_CONNECTIONS_PER_MONITORED_DB)
 				i := 0
 				for i < MAX_PG_CONNECTIONS_PER_MONITORED_DB {
-					log.Error("initializing db_conn_limiting_channel", i)
+					log.Debugf("initializing db_conn_limiting_channel %d for [%s]", i, db_unique)
 					db_conn_limiting_channel[db_unique] <- true
 					i++
 				}
 				db_conn_limiting_channel_lock.Unlock()
 
 				if db_type == "postgres" {
-					_, err = DBExecReadByDbUniqueName(db_unique, "", false, "select 1") // test connectivity
+					ver, err = DBGetPGVersion(db_unique)
 				} else if db_type == "pgbouncer" {
 					_, err = DBExecReadByDbUniqueName(db_unique, "", false, "show version")
 				}
@@ -2281,7 +2278,7 @@ func main() {
 					log.Errorf("could not start metric gathering for DB \"%s\" due to connection problem: %s", db_unique, err)
 					continue
 				} else {
-					log.Info("Connect OK")
+					log.Infof("Connect OK. [%s] is on version %s (in recovery: %v)", db_unique, ver.Version, ver.IsInRecovery)
 				}
 
 				if host.IsSuperuser || adHocMode {
@@ -2289,8 +2286,7 @@ func main() {
 					TryCreateMetricsFetchingHelpers(db_unique)
 				}
 
-				// TODO move to metricsticker?
-				time.Sleep(time.Millisecond * 100) // not to cause a huge load spike when starting the daemon with 20+ monitored DBs
+				time.Sleep(time.Millisecond * 100) // not to cause a huge load spike when starting the daemon with 100+ monitored DBs
 			}
 
 			for metric := range host_config {
