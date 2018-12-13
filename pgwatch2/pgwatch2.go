@@ -1362,17 +1362,23 @@ func MetricGathererLoop(dbUniqueName, dbType, metricName string, config_map map[
 
 	for {
 		if running {
+			t1 := time.Now()
 			_, err := MetricsFetcher(
 				MetricFetchMessage{DBUniqueName: dbUniqueName, MetricName: metricName, DBType: dbType,
 					CreatedOn: time.Now(), Interval: time.Millisecond * time.Duration(interval*1000)},
 				host_state,
 				store_ch)
+			t2 := time.Now()
 			if err != nil {
 				if last_error_notification_time.Add(time.Second * time.Duration(60)).Before(time.Now()) {
 					log.Errorf("Total failed fetches for [%s:%s]: %d", failed_fetches)
 					last_error_notification_time = time.Now()
 				}
 				failed_fetches += 1
+			}
+
+			if t2.Sub(t1) > (time.Second * time.Duration(interval)) {
+				log.Warningf("Total fetching time of %v bigger than %vs interval for [%s:%s]", t2.Sub(t1), interval, dbUniqueName, metricName)
 			}
 		}
 
@@ -2353,11 +2359,11 @@ func main() {
 				}
 			}
 
-			log.Warning("shutting down gatherer for ", db, ":", metric)
+			log.Warningf("shutting down gatherer for [%s:%s] ...", db, metric)
 			control_channels[db_metric] <- ControlMessage{Action: "STOP"}
 			time.Sleep(time.Second * 1)
 			delete(control_channels, db_metric)
-			log.Debug("channel deleted for", db_metric)
+			log.Infof("control channel for [%s:%s] deleted", db, metric)
 
 		}
 
