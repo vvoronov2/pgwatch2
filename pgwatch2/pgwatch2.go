@@ -511,7 +511,7 @@ retry:
 
 			if epoch_ns == 0 {
 				if !ts_warning_printed && msg.MetricName != "pgbouncer_stats" {
-					log.Warning("No timestamp_ns found, server time will be used. measurement:", msg.MetricName)
+					log.Warning("No timestamp_ns found, (gatherer) server time will be used. measurement:", msg.MetricName)
 					ts_warning_printed = true
 				}
 				epoch_time = time.Now()
@@ -562,7 +562,7 @@ func SendToGraphite(dbname, measurement string, data [](map[string]interface{}))
 		log.Warning("No data passed to SendToGraphite call")
 		return nil
 	}
-	log.Debug(fmt.Sprintf("Writing %d rows to Graphite", len(data)))
+	log.Debugf("Writing %d rows to Graphite", len(data))
 
 	metric_base_prefix := GRAPHITE_METRICS_PREFIX + "." + measurement + "." + dbname + "."
 	metrics := make([]graphite.Metric, 0, len(data)*len(data[0]))
@@ -675,8 +675,8 @@ func ProcessRetryQueue(data_source, conn_str, conn_ident string, retry_queue *li
 		if err != nil {
 			if data_source == DATASTORE_INFLUX && strings.Contains(err.Error(), "unable to parse") {
 				if len(msg) == 1 { // can only pinpoint faulty input data without batching
-					log.Error(fmt.Sprintf("Dropping metric [%s:%s] as Influx is unable to parse the data: %v",
-						msg[0].DBUniqueName, msg[0].MetricName, msg[0].Data)) // ignore data points consisting of anything else than strings and floats
+					log.Errorf("Dropping metric [%s:%s] as Influx is unable to parse the data: %v",
+						msg[0].DBUniqueName, msg[0].MetricName, msg[0].Data) // ignore data points consisting of anything else than strings and floats
 					atomic.AddUint64(&totalMetricsDroppedCounter, 1)
 				} else {
 					log.Errorf("Dropping %d metric-sets as Influx is unable to parse the data: %s", len(msg), err)
@@ -813,7 +813,7 @@ func MetricsPersister(data_store string, storage_ch <-chan []MetricStoreMessage)
 								// TODO loop over single metrics in case of errors?
 							}
 						} else {
-							log.Error(fmt.Sprintf("Failed to write into datastore %d: %s", i, err))
+							log.Errorf("Failed to write into datastore %d: %s", i, err)
 							in_error[i] = true
 							retry_queue.PushFront(msg_arr)
 						}
@@ -854,7 +854,7 @@ func DBGetPGVersion(dbUnique string) (DBVersionMapEntry, error) {
 	db_pg_version_map_lock.RUnlock()
 
 	if ok && ver.LastCheckedOn.After(time.Now().Add(time.Minute*-2)) { // use cached version for 2 min
-		log.Debug(fmt.Sprintf("using cached postgres version %s for %s", ver.Version.String(), dbUnique))
+		log.Debugf("using cached postgres version %s for %s", ver.Version.String(), dbUnique)
 		return ver, nil
 	} else {
 		log.Debug("determining DB version for", dbUnique)
@@ -1199,8 +1199,8 @@ func DetectConfigurationChanges(dbUnique string, db_pg_version decimal.Decimal, 
 		prev_hash, ok := host_state["configuration_hashes"][obj_ident]
 		if ok { // we have existing state
 			if prev_hash != dr["value"].(string) {
-				log.Warning(fmt.Sprintf("detected settings change: %s = %s (prev: %s)",
-					dr["tag_setting"], dr["value"], prev_hash))
+				log.Warningf("detected settings change: %s = %s (prev: %s)",
+					dr["tag_setting"], dr["value"], prev_hash)
 				dr["event"] = "alter"
 				detected_changes = append(detected_changes, dr)
 				host_state["configuration_hashes"][obj_ident] = dr["value"].(string)
@@ -1279,7 +1279,7 @@ func FilterPgbouncerData(data []map[string]interface{}, database_to_keep string)
 	return filtered_data
 }
 
-func MetricsFetcher(msg MetricFetchMessage, host_state map[string]map[string]string, storage_ch chan<- []MetricStoreMessage) (int, error) {
+func FetchAndStore(msg MetricFetchMessage, host_state map[string]map[string]string, storage_ch chan<- []MetricStoreMessage) (int, error) {
 	var db_pg_version decimal.Decimal
 	var err error
 
@@ -1323,15 +1323,15 @@ func MetricsFetcher(msg MetricFetchMessage, host_state map[string]map[string]str
 				ver, _ := db_pg_version_map[msg.DBUniqueName]
 				db_pg_version_map_lock.RUnlock()
 				if ver.IsInRecovery {
-					log.Info(fmt.Sprintf("failed to fetch metrics for '%s', metric '%s': %s", msg.DBUniqueName, msg.MetricName, err))
+					log.Infof("failed to fetch metrics for '%s', metric '%s': %s", msg.DBUniqueName, msg.MetricName, err)
 					return 0, err
 				}
 			}
-			log.Error(fmt.Sprintf("failed to fetch metrics for '%s', metric '%s': %s", msg.DBUniqueName, msg.MetricName, err))
+			log.Errorf("failed to fetch metrics for '%s', metric '%s': %s", msg.DBUniqueName, msg.MetricName, err)
 		} else {
 			md, err := GetMonitoredDatabaseByUniqueName(msg.DBUniqueName)
 			if err != nil {
-				log.Error(fmt.Sprintf("could not get monitored DB details for %s: %s", msg.DBUniqueName, err))
+				log.Errorf("could not get monitored DB details for %s: %s", msg.DBUniqueName, err)
 				return len(data), err
 			}
 
@@ -1363,14 +1363,13 @@ func MetricGathererLoop(dbUniqueName, dbType, metricName string, config_map map[
 	for {
 		if running {
 			t1 := time.Now()
-			_, err := MetricsFetcher(
-				MetricFetchMessage{DBUniqueName: dbUniqueName, MetricName: metricName, DBType: dbType,
-					CreatedOn: time.Now(), Interval: time.Millisecond * time.Duration(interval*1000)},
+			_, err := FetchAndStore(
+				MetricFetchMessage{DBUniqueName: dbUniqueName, MetricName: metricName, DBType: dbType},
 				host_state,
 				store_ch)
 			t2 := time.Now()
 			if err != nil {
-				if last_error_notification_time.Add(time.Second * time.Duration(60)).Before(time.Now()) {
+				if last_error_notification_time.Add(time.Second * time.Duration(600)).Before(time.Now()) {
 					log.Errorf("Total failed fetches for [%s:%s]: %d", failed_fetches)
 					last_error_notification_time = time.Now()
 				}
@@ -1388,20 +1387,23 @@ func MetricGathererLoop(dbUniqueName, dbType, metricName string, config_map map[
 			if msg.Action == "START" {
 				config = msg.Config
 				interval = config[metricName]
-				ticker = time.NewTicker(time.Second * time.Duration(interval))
+				if ticker != nil {
+					ticker.Stop()
+				}
+				ticker = time.NewTicker(time.Millisecond * time.Duration(interval*1000))
 				if !running {
 					running = true
-					log.Info("started MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
+					log.Debug("started MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
 				}
 			} else if msg.Action == "STOP" && running {
-				log.Info("exiting MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
+				log.Debug("exiting MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
 				return
 			} else if msg.Action == "PAUSE" && running {
-				log.Info("pausing MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
+				log.Debug("pausing MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
 				running = false
 			}
 		case <-ticker.C:
-			log.Debug(fmt.Sprintf("MetricGathererLoop for %s:%s slept for %s", dbUniqueName, metricName, time.Second*time.Duration(interval)))
+			log.Debugf("MetricGathererLoop for [%s:%s] slept for %s", dbUniqueName, metricName, time.Second*time.Duration(interval))
 		}
 
 	}
@@ -1490,7 +1492,7 @@ func queryDB(clnt client.Client, cmd string) (res []client.Result, err error) {
 }
 
 func InitAndTestInfluxConnection(HostId, InfluxHost, InfluxPort, InfluxDbname, InfluxUser, InfluxPassword, InfluxSSL, SkipSSLCertVerify string, RetentionPeriod int64) (string, error) {
-	log.Info(fmt.Sprintf("Testing Influx connection to host %s: %s, port: %s, DB: %s", HostId, InfluxHost, InfluxPort, InfluxDbname))
+	log.Infof("Testing Influx connection to host %s: %s, port: %s, DB: %s", HostId, InfluxHost, InfluxPort, InfluxDbname)
 	var connect_string string
 	skipSSLCertVerify, _ := strconv.ParseBool(SkipSSLCertVerify)
 
@@ -1534,13 +1536,13 @@ retry:
 		}
 	}
 
-	log.Warning(fmt.Sprintf("Database '%s' not found! Creating with %d retention and retention policy name \"%s\"...", InfluxDbname, RetentionPeriod, opts.InfluxRetentionName))
+	log.Warningf("Database '%s' not found! Creating with %d retention and retention policy name \"%s\"...", InfluxDbname, RetentionPeriod, opts.InfluxRetentionName)
 	isql := fmt.Sprintf("CREATE DATABASE %s WITH DURATION %dd REPLICATION 1 SHARD DURATION 1d NAME %s", InfluxDbname, RetentionPeriod, opts.InfluxRetentionName)
 	res, err = queryDB(c, isql)
 	if err != nil {
 		log.Fatal(err)
 	} else {
-		log.Info("Database 'pgwatch2' created on host", fmt.Sprintf("%s:%s", InfluxHost, InfluxPort))
+		log.Infof("Database 'pgwatch2' created on InfluxDB host %s:%s", InfluxHost, InfluxPort)
 	}
 
 	return connect_string, nil
@@ -1555,7 +1557,7 @@ func DoesFunctionExists(dbUnique, functionName string) bool {
 		return false
 	}
 	if len(data) > 0 {
-		log.Debug(fmt.Sprintf("Function %s exists on %s", functionName, dbUnique))
+		log.Debugf("Function %s exists on %s", functionName, dbUnique)
 		return true
 	}
 	return false
@@ -1565,14 +1567,14 @@ func DoesFunctionExists(dbUnique, functionName string) bool {
 func TryCreateMetricsFetchingHelpers(dbUnique string) error {
 	db_pg_version, err := DBGetPGVersion(dbUnique)
 	if err != nil {
-		log.Error(fmt.Sprintf("Failed to fetch pg version for \"%s\": %s", dbUnique, err))
+		log.Errorf("Failed to fetch pg version for \"%s\": %s", dbUnique, err)
 		return err
 	}
 
 	if fileBased {
 		helpers, err := ReadMetricsFromFolder(path.Join(opts.MetricsFolder, FILE_BASED_METRIC_HELPERS_DIR), false)
 		if err != nil {
-			log.Error(fmt.Sprintf("Failed to fetch helpers from \"%s\": %s", path.Join(opts.MetricsFolder, FILE_BASED_METRIC_HELPERS_DIR), err))
+			log.Errorf("Failed to fetch helpers from \"%s\": %s", path.Join(opts.MetricsFolder, FILE_BASED_METRIC_HELPERS_DIR), err)
 			return err
 		}
 		log.Debug("%d helper definitions found from \"%s\"...", len(helpers), path.Join(opts.MetricsFolder, FILE_BASED_METRIC_HELPERS_DIR))
@@ -2250,7 +2252,7 @@ func main() {
 		log.Info("nr. of active hosts:", len(monitored_dbs))
 
 		for _, host := range monitored_dbs {
-			log.Info("processing database:", host.DBUniqueName, ", config:", host.Metrics, ", custom tags:", host.CustomTags)
+			log.Debug("processing database:", host.DBUniqueName, ", config:", host.Metrics, ", custom tags:", host.CustomTags)
 
 			host_config := host.Metrics
 			db_unique := host.DBUniqueName
@@ -2264,7 +2266,7 @@ func main() {
 				var err error
 				var ver DBVersionMapEntry
 
-				log.Info(fmt.Sprintf("new host \"%s\" found, checking connectivity...", db_unique))
+				log.Infof("new host \"%s\" found, checking connectivity...", db_unique)
 				db_conn_limiting_channel_lock.Lock()
 				db_conn_limiting_channel[db_unique] = make(chan bool, MAX_PG_CONNECTIONS_PER_MONITORED_DB)
 				i := 0
@@ -2325,7 +2327,7 @@ func main() {
 				} else if !metric_def_ok {
 					epoch, ok := last_sql_fetch_error.Load(metric)
 					if !ok || ((time.Now().Unix() - epoch.(int64)) > 3600) { // complain only 1x per hour
-						log.Warning(fmt.Sprintf("metric definiton \"%s\" not found for \"%s\"", metric, db_unique))
+						log.Warningf("metric definiton \"%s\" not found for \"%s\"", metric, db_unique)
 						last_sql_fetch_error.Store(metric, time.Now().Unix())
 					}
 				} else {
@@ -2340,9 +2342,17 @@ func main() {
 		}
 
 		// loop over existing channels and stop workers if DB or metric removed from config
-		log.Info("checking if any workers need to be shut down...")
+		log.Debug("checking if any workers need to be shut down...")
+		control_channel_list := make([]string, len(control_channels))
+		i := 0
+		for key := range control_channels {
+			control_channel_list[i] = key
+			i++
+		}
+		gatherers_shut_down := 0
+
 	next_chan:
-		for db_metric := range control_channels {
+		for _, db_metric := range control_channel_list {
 			splits := strings.Split(db_metric, ":")
 			db := splits[0]
 			metric := splits[1]
@@ -2359,15 +2369,16 @@ func main() {
 				}
 			}
 
-			log.Warningf("shutting down gatherer for [%s:%s] ...", db, metric)
+			log.Infof("shutting down gatherer for [%s:%s] ...", db, metric)
 			control_channels[db_metric] <- ControlMessage{Action: "STOP"}
-			time.Sleep(time.Second * 1)
 			delete(control_channels, db_metric)
 			log.Infof("control channel for [%s:%s] deleted", db, metric)
-
+			gatherers_shut_down++
 		}
-
-		log.Debug(fmt.Sprintf("main sleeping %ds...", ACTIVE_SERVERS_REFRESH_TIME))
+		if gatherers_shut_down > 0 {
+			log.Warningf("sent STOP message to %d gatherers (it might take some minutes for them to stop though)", gatherers_shut_down)
+		}
+		log.Debugf("main sleeping %ds...", ACTIVE_SERVERS_REFRESH_TIME)
 		time.Sleep(time.Second * time.Duration(ACTIVE_SERVERS_REFRESH_TIME))
 	}
 
