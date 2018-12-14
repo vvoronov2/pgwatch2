@@ -2315,8 +2315,7 @@ func main() {
 				} else if !metric_def_ok && ch_ok {
 					// metric definition files were recently removed
 					log.Warning("shutting down metric", metric, "for", host.DBUniqueName)
-					control_channels[db_metric] <- ControlMessage{Action: "STOP"}
-					time.Sleep(time.Second * 1) // try to be more deterministic here?
+					control_channels[db_metric] <- ControlMessage{Action: GATHERER_STATUS_STOP}
 					delete(control_channels, db_metric)
 				} else if !metric_def_ok {
 					epoch, ok := last_sql_fetch_error.Load(metric)
@@ -2328,7 +2327,7 @@ func main() {
 					// check if interval has changed
 					if host_metric_interval_map[db_metric] != interval {
 						log.Warning("sending interval update for", db_unique, metric)
-						control_channels[db_metric] <- ControlMessage{Action: "START", Config: host_config}
+						control_channels[db_metric] <- ControlMessage{Action: GATHERER_STATUS_START, Config: host_config}
 						host_metric_interval_map[db_metric] = interval
 					}
 				}
@@ -2364,7 +2363,7 @@ func main() {
 			}
 
 			log.Infof("shutting down gatherer for [%s:%s] ...", db, metric)
-			control_channels[db_metric] <- ControlMessage{Action: "STOP"}
+			control_channels[db_metric] <- ControlMessage{Action: GATHERER_STATUS_STOP}
 			delete(control_channels, db_metric)
 			log.Infof("control channel for [%s:%s] deleted", db, metric)
 			gatherers_shut_down++
