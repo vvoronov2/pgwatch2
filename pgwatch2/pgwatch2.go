@@ -34,6 +34,8 @@ import (
 	"github.com/lib/pq"
 	"github.com/marpaia/graphite-golang"
 	"github.com/op/go-logging"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/shopspring/decimal"
 	"golang.org/x/crypto/pbkdf2"
 	yaml "gopkg.in/yaml.v2"
@@ -132,6 +134,7 @@ const DATASTORE_INFLUX = "influx"
 const DATASTORE_GRAPHITE = "graphite"
 const DATASTORE_JSON = "json"
 const DATASTORE_POSTGRES = "postgres"
+const DATASTORE_PROMETHEUS = "prometheus"
 const PRESET_CONFIG_YAML_FILE = "preset-configs.yaml"
 const FILE_BASED_METRIC_HELPERS_DIR = "00_helpers"
 const PG_CONN_RECYCLE_SECONDS = 1800                // applies for monitored nodes
@@ -142,6 +145,7 @@ const GATHERER_STATUS_START = "START"
 const GATHERER_STATUS_STOP = "STOP"
 const METRICDB_IDENT = "metricDb"
 const CONFIGDB_IDENT = "configDb"
+const CONTEXT_PROMETHEUS_SCRAPE = "prometheus-scrape"
 
 var configDb *sqlx.DB
 var metricDb *sqlx.DB
@@ -2000,7 +2004,7 @@ func FilterPgbouncerData(data []map[string]interface{}, database_to_keep string)
 	return filtered_data
 }
 
-func FetchMetrics(msg MetricFetchMessage, host_state map[string]map[string]string, storage_ch chan<- []MetricStoreMessage) ([]MetricStoreMessage, error) {
+func FetchMetrics(msg MetricFetchMessage, host_state map[string]map[string]string, storage_ch chan<- []MetricStoreMessage, context string) ([]MetricStoreMessage, error) {
 	var vme DBVersionMapEntry
 	var db_pg_version decimal.Decimal
 	var err error
@@ -2037,8 +2041,8 @@ func FetchMetrics(msg MetricFetchMessage, host_state map[string]map[string]strin
 		return nil, nil
 	}
 
-	if msg.MetricName == "change_events" { // special handling, multiple queries + stateful
-		CheckForPGObjectChangesAndStore(msg.DBUniqueName, db_pg_version, storage_ch, host_state)
+	if msg.MetricName == "change_events" && context != CONTEXT_PROMETHEUS_SCRAPE { // special handling, multiple queries + stateful
+		CheckForPGObjectChangesAndStore(msg.DBUniqueName, db_pg_version, storage_ch, host_state) // TODO no host_state for Prometheus
 	} else {
 
 		data, err, duration := DBExecReadByDbUniqueName(msg.DBUniqueName, msg.MetricName, useConnPooling, mvp.Sql)
@@ -2133,7 +2137,8 @@ func MetricGathererLoop(dbUniqueName, dbType, metricName string, config_map map[
 		metricStoreMessages, err := FetchMetrics(
 			MetricFetchMessage{DBUniqueName: dbUniqueName, MetricName: metricName, DBType: dbType},
 			host_state,
-			store_ch)
+			store_ch,
+			"")
 		t2 := time.Now()
 
 		if t2.Sub(t1) > (time.Second * time.Duration(interval)) {
@@ -2834,9 +2839,11 @@ type Options struct {
 	Password             string `long:"password" description:"PG config DB password" env:"PW2_PGPASSWORD"`
 	PgRequireSSL         string `long:"pg-require-ssl" description:"PG config DB SSL connection only" default:"false" env:"PW2_PGSSL"`
 	Group                string `short:"g" long:"group" description:"Group (or groups, comma separated) for filtering which DBs to monitor. By default all are monitored" env:"PW2_GROUP"`
-	Datastore            string `long:"datastore" description:"[influx|postgres|graphite|json]" default:"influx" env:"PW2_DATASTORE"`
+	Datastore            string `long:"datastore" description:"[influx|postgres|graphite|json|prometheus]" default:"influx" env:"PW2_DATASTORE"`
 	PGMetricStoreConnStr string `long:"pg-metric-store-conn-str" description:"PG Metric Store" env:"PW2_PG_METRIC_STORE_CONN_STR"`
 	PGRetentionDays      int64  `long:"pg-retention-days" description:"If set, metrics older than that will be deleted" default:"30" env:"PW2_PG_RETENTION_DAYS"`
+	PrometheusPort       int64  `long:"prometheus-port" description:"9187" default:"9187" env:"PW2_PROMETHEUS_PORT"`
+	//	PrometheusConnStr    string `long:"prometheus-conn-str" description:"PG server to monitor" env:"PW2_PROMETHEUS_CONN_STR"`
 	InfluxHost           string `long:"ihost" description:"Influx host" default:"localhost" env:"PW2_IHOST"`
 	InfluxPort           string `long:"iport" description:"Influx port" default:"8086" env:"PW2_IPORT"`
 	InfluxDbname         string `long:"idbname" description:"Influx DB name" default:"pgwatch2" env:"PW2_IDATABASE"`
@@ -3115,6 +3122,9 @@ func main() {
 			log.Info("starting old Postgres metrics cleanup job...")
 			go OldPostgresMetricsDeleter(opts.PGRetentionDays, PGSchemaType)
 		}
+
+	} else if opts.Datastore == DATASTORE_PROMETHEUS {
+		// TODO test port open
 	} else {
 		log.Fatal("Unknown datastore. Check the --datastore param")
 	}
@@ -3273,7 +3283,13 @@ func main() {
 					TryCreateMetricsFetchingHelpers(db_unique)
 				}
 
-				time.Sleep(time.Millisecond * 100) // not to cause a huge load spike when starting the daemon with 100+ monitored DBs
+				if opts.Datastore != DATASTORE_PROMETHEUS {
+					time.Sleep(time.Millisecond * 100) // not to cause a huge load spike when starting the daemon with 100+ monitored DBs
+				}
+			}
+
+			if opts.Datastore == DATASTORE_PROMETHEUS {
+				continue
 			}
 
 			for metric := range host_config {
@@ -3317,6 +3333,35 @@ func main() {
 					}
 				}
 			}
+		}
+
+		if opts.Datastore == DATASTORE_PROMETHEUS { // special behaviour, no "ahead of time" metric collection
+			// TODO discover metric / config changes via hash ?
+
+			//for metric := range host_config {
+			//interval := host_config[metric]
+
+			// metric_def_map_lock.RLock()
+			// _, metric_def_ok := metric_def_map[metric]
+			// metric_def_map_lock.RUnlock()
+
+			exporter, err := NewExporter()
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			prometheus.MustRegister(exporter)
+			log.Error("PROM registered...")
+
+			http.Handle("/metrics", promhttp.Handler())
+
+			log.Fatal(http.ListenAndServe(":9188", nil))
+
+			log.Debugf("main sleeping %ds...", ACTIVE_SERVERS_REFRESH_TIME)
+			time.Sleep(time.Second * time.Duration(10000))
+			time.Sleep(time.Second * time.Duration(ACTIVE_SERVERS_REFRESH_TIME))
+			continue
+			//}
 		}
 
 		if opts.TestdataDays > 0 {
