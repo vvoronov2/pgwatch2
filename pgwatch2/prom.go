@@ -2,12 +2,14 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Exporter struct {
@@ -140,7 +142,7 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 				if dataType == "float64" || dataType == "float32" || dataType == "int64" || dataType == "int32" || dataType == "int" || dataType == "decimal.Decimal" {
 					f, err := strconv.ParseFloat(fmt.Sprintf("%v", v), 64)
 					if err != nil {
-						log.Warningf("Skipping column %s of [%s:%s]: %v", k, msg.DBUniqueName, msg.MetricName, err)
+						log.Warningf("Skipping scraping column %s of [%s:%s]: %v", k, msg.DBUniqueName, msg.MetricName, err)
 					}
 					fields[k] = f
 				} else if dataType == "bool" {
@@ -149,6 +151,8 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 					} else {
 						fields[k] = 0
 					}
+				} else {
+					log.Warningf("Skipping scraping column %s of [%s:%s], unsupported datatype: %s", k, msg.DBUniqueName, msg.MetricName, dataType)
 				}
 			}
 		}
@@ -164,7 +168,7 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 			label_keys = append(label_keys, k)
 			label_values = append(label_values, v)
 		}
-		// for all fields a separate metric named: pgwatch2_metric_column
+		// for all fields a separate metric named: pgwatch2_metricname_columnname
 		for field, value := range fields {
 			desc := prometheus.NewDesc(fmt.Sprintf("%s_%s_%s", "pgwatch2", msg.MetricName, field),
 				msg.MetricName, label_keys, nil)
@@ -174,4 +178,23 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 		}
 	}
 	return promMetrics
+}
+
+func StartPrometheusExporter(port int64) {
+	promExporter, err := NewExporter()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	prometheus.MustRegister(promExporter)
+
+	var promServer = &http.Server{Addr: fmt.Sprintf(":%d", opts.PrometheusPort), Handler: promhttp.Handler()}
+
+	go func() {
+		for { // ListenAndServe call should not normally return, but looping just in case
+			log.Info("starting Prometheus exporter on port %d ...", opts.PrometheusPort)
+			log.Error("Prometheus listener failure:", promServer.ListenAndServe())
+			time.Sleep(time.Second * 1)
+		}
+	}()
 }

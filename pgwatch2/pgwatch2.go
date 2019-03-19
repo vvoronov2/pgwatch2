@@ -34,8 +34,6 @@ import (
 	"github.com/lib/pq"
 	"github.com/marpaia/graphite-golang"
 	"github.com/op/go-logging"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/shopspring/decimal"
 	"golang.org/x/crypto/pbkdf2"
 	yaml "gopkg.in/yaml.v2"
@@ -186,6 +184,8 @@ var PGDummyMetricTables = make(map[string]time.Time)
 var PGDummyMetricTablesLock = sync.RWMutex{}
 var PGSchemaType string
 var failedInitialConnectHosts = make(map[string]bool) // hosts that couldn't be connected to even once
+var promExporter *Exporter
+var promServer *http.Server
 
 func GetPostgresDBConnection(libPqConnString, host, port, dbname, user, password, sslmode, sslrootcert, sslcert, sslkey string) (*sqlx.DB, error) {
 	var err error
@@ -3124,7 +3124,11 @@ func main() {
 		}
 
 	} else if opts.Datastore == DATASTORE_PROMETHEUS {
-		// TODO test port open
+		if opts.TestdataDays > 0 || opts.TestdataMultiplier > 0 {
+			log.Fatal("Test data generation mode cannot be used with Prometheus data store")
+		}
+
+		StartPrometheusExporter(opts.PrometheusPort)
 	} else {
 		log.Fatal("Unknown datastore. Check the --datastore param")
 	}
@@ -3336,32 +3340,9 @@ func main() {
 		}
 
 		if opts.Datastore == DATASTORE_PROMETHEUS { // special behaviour, no "ahead of time" metric collection
-			// TODO discover metric / config changes via hash ?
-
-			//for metric := range host_config {
-			//interval := host_config[metric]
-
-			// metric_def_map_lock.RLock()
-			// _, metric_def_ok := metric_def_map[metric]
-			// metric_def_map_lock.RUnlock()
-
-			exporter, err := NewExporter()
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			prometheus.MustRegister(exporter)
-			log.Error("PROM registered...")
-
-			http.Handle("/metrics", promhttp.Handler())
-
-			log.Fatal(http.ListenAndServe(":9188", nil))
-
 			log.Debugf("main sleeping %ds...", ACTIVE_SERVERS_REFRESH_TIME)
-			time.Sleep(time.Second * time.Duration(10000))
 			time.Sleep(time.Second * time.Duration(ACTIVE_SERVERS_REFRESH_TIME))
 			continue
-			//}
 		}
 
 		if opts.TestdataDays > 0 {
