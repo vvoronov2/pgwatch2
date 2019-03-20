@@ -10,21 +10,20 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/shopspring/decimal"
 )
 
 type Exporter struct {
-	URI                               string
-	up                                prometheus.Gauge
+	lastScrapeErrors                  prometheus.Gauge
 	totalScrapes, totalScrapeFailures prometheus.Counter
-	serverMetrics                     map[int]*prometheus.Desc
 }
 
 func NewExporter() (*Exporter, error) {
 	return &Exporter{
-		up: prometheus.NewGauge(prometheus.GaugeOpts{
+		lastScrapeErrors: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "pgwatch2",
-			Name:      "up",
-			Help:      "Was the last scrape of haproxy successful.",
+			Name:      "exporter_last_scrape_errors",
+			Help:      "Last scrape error count for all monitored hosts / metrics",
 		}),
 		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "pgwatch2",
@@ -39,47 +38,39 @@ func NewExporter() (*Exporter, error) {
 	}, nil
 }
 
-// Describe describes all the metrics ever exported by the HAProxy exporter. It
-// implements prometheus.Collector.
+// Not really needed for scraping to work
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
-	// ch <- e.up.Desc()
-	// ch <- e.totalScrapes.Desc()
-	// ch <- e.totalScrapeFailures.Desc()
 }
 
-// Collect fetches the stats from configured HAProxy location and delivers them
-// as Prometheus metrics. It implements prometheus.Collector.
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
+	var lastScrapeErrors float64
 
 	e.totalScrapes.Add(1)
-	e.totalScrapeFailures.Add(1)
-
-	ch <- prometheus.MustNewConstMetric(e.up.Desc(), prometheus.GaugeValue, 1)
 	ch <- e.totalScrapes
-	ch <- e.totalScrapeFailures
-	m := prometheus.MustNewConstMetric(prometheus.NewDesc("pgwatch2_sadasd", "sadasd", nil, nil), prometheus.GaugeValue, 100)
-	ch <- prometheus.NewMetricWithTimestamp(time.Now(), m)
 
 	monitoredDatabases := getMonitoredDatabasesSnapshot()
 	if len(monitoredDatabases) == 0 {
 		log.Warning("No dbs configured for monitoring. Check config")
+		ch <- e.totalScrapeFailures
+		e.lastScrapeErrors.Set(0)
+		ch <- e.lastScrapeErrors
 		return
 	}
 	for name, md := range monitoredDatabases {
-		log.Warning("processing host:", name, ", metrics:", md.Metrics)
 		for metric, interval := range md.Metrics {
 			if interval > 0 {
-				log.Warning("scraping", metric, ":", interval)
-				metricStoreMessages, err := FetchMetrics( // TODO pooling
+				log.Debugf("scraping [%s:%s]...", md.DBUniqueName, metric)
+				metricStoreMessages, err := FetchMetrics( // TODO conn pooling
 					MetricFetchMessage{DBUniqueName: name, MetricName: metric, DBType: md.DBType},
 					nil,
 					nil,
 					CONTEXT_PROMETHEUS_SCRAPE)
 				if err != nil {
 					log.Errorf("failed to fetch [%s:%s]: %v", name, metric, err)
+					e.totalScrapeFailures.Add(1)
+					lastScrapeErrors++
 					continue
 				}
-				log.Warning("metricStoreMessages", metricStoreMessages)
 				promMetrics := MetricStoreMessageToPromMetrics(metricStoreMessages[0])
 				for _, pm := range promMetrics { // collect & send later in batch? capMetricChan = 1000 limit in prometheus code
 					ch <- pm
@@ -87,6 +78,9 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 	}
+	ch <- e.totalScrapeFailures
+	e.lastScrapeErrors.Set(lastScrapeErrors)
+	ch <- e.lastScrapeErrors
 }
 
 func getMonitoredDatabasesSnapshot() map[string]MonitoredDatabase {
@@ -139,7 +133,11 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 				labels[tag] = fmt.Sprintf("%v", v)
 			} else {
 				dataType := reflect.TypeOf(v).String()
-				if dataType == "float64" || dataType == "float32" || dataType == "int64" || dataType == "int32" || dataType == "int" || dataType == "decimal.Decimal" {
+				log.Error(k, v, dataType)
+				if dataType == "decimal.Decimal" {
+					log.Fatal(decimal.NewFromString(v.(string)))
+				}
+				if dataType == "float64" || dataType == "float32" || dataType == "int64" || dataType == "int32" || dataType == "int" {
 					f, err := strconv.ParseFloat(fmt.Sprintf("%v", v), 64)
 					if err != nil {
 						log.Warningf("Skipping scraping column %s of [%s:%s]: %v", k, msg.DBUniqueName, msg.MetricName, err)
@@ -170,9 +168,10 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 		}
 		// for all fields a separate metric named: pgwatch2_metricname_columnname
 		for field, value := range fields {
-			desc := prometheus.NewDesc(fmt.Sprintf("%s_%s_%s", "pgwatch2", msg.MetricName, field),
+			fieldPromDataType, cleanedField := DerivePromDataTypeFromColumnNameAndCleanTypeHint(field) // TODO ignore prom_type_gauge/counter for other data sources
+			desc := prometheus.NewDesc(fmt.Sprintf("%s_%s_%s", "pgwatch2", msg.MetricName, cleanedField),
 				msg.MetricName, label_keys, nil)
-			m := prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, value, label_values...) // TODO gauge vs counter
+			m := prometheus.MustNewConstMetric(desc, fieldPromDataType, value, label_values...) // TODO gauge vs counter
 			promMetrics = append(promMetrics, prometheus.NewMetricWithTimestamp(epoch_time, m))
 
 		}
@@ -181,6 +180,7 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 }
 
 func StartPrometheusExporter(port int64) {
+	listenLoops := 0
 	promExporter, err := NewExporter()
 	if err != nil {
 		log.Fatal(err)
@@ -190,11 +190,27 @@ func StartPrometheusExporter(port int64) {
 
 	var promServer = &http.Server{Addr: fmt.Sprintf(":%d", opts.PrometheusPort), Handler: promhttp.Handler()}
 
-	go func() {
-		for { // ListenAndServe call should not normally return, but looping just in case
-			log.Info("starting Prometheus exporter on port %d ...", opts.PrometheusPort)
-			log.Error("Prometheus listener failure:", promServer.ListenAndServe())
-			time.Sleep(time.Second * 1)
+	for { // ListenAndServe call should not normally return, but looping just in case
+		log.Infof("starting Prometheus exporter on port %d ...", opts.PrometheusPort)
+		err = promServer.ListenAndServe()
+		if listenLoops == 0 {
+			log.Fatal("Prometheus listener failure:", err)
+		} else {
+			log.Error("Prometheus listener failure:", err)
 		}
-	}()
+		time.Sleep(time.Second * 5)
+	}
+}
+
+func DerivePromDataTypeFromColumnNameAndCleanTypeHint(field string) (prometheus.ValueType, string) {
+	promType := prometheus.CounterValue // default
+	cleanedField := field
+
+	if strings.Contains(field, "_prom_type_counter") {
+		cleanedField = strings.ReplaceAll(field, "_prom_type_counter", "")
+	} else if strings.Contains(field, "_prom_type_gauge") {
+		promType = prometheus.GaugeValue
+		cleanedField = strings.ReplaceAll(field, "_prom_type_gauge", "")
+	}
+	return promType, cleanedField
 }

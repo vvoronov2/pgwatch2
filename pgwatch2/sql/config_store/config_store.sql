@@ -73,6 +73,7 @@ create table metric (
     m_last_modified_on  timestamptz not null default now(),
     m_master_only bool default false,
     m_standby_only bool default false,
+    m_prom_gauge_columns text,  -- default is counter
 
     unique (m_name, m_pg_version_from),
     check (not (m_master_only and m_standby_only)),

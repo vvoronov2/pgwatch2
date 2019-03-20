@@ -622,13 +622,14 @@ retry:
 				if v == nil || v == "" {
 					continue // not storing NULLs
 				}
-				if k == EPOCH_COLUMN_NAME {
+				_, kCleaned := DerivePromDataTypeFromColumnNameAndCleanTypeHint(k) // get rid of Prometheus "annotations" if any
+				if kCleaned == EPOCH_COLUMN_NAME {
 					epoch_ns = v.(int64)
-				} else if strings.HasPrefix(k, "tag_") {
-					tag := k[4:]
+				} else if strings.HasPrefix(kCleaned, "tag_") {
+					tag := kCleaned[4:]
 					tags[tag] = fmt.Sprintf("%v", v)
 				} else {
-					fields[k] = v
+					fields[kCleaned] = v
 				}
 			}
 
@@ -712,13 +713,14 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 				if v == nil || v == "" {
 					continue // not storing NULLs
 				}
-				if k == EPOCH_COLUMN_NAME {
+				_, kCleaned := DerivePromDataTypeFromColumnNameAndCleanTypeHint(k) // get rid of Prometheus "annotations" if any
+				if kCleaned == EPOCH_COLUMN_NAME {
 					epoch_ns = v.(int64)
-				} else if strings.HasPrefix(k, "tag_") {
-					tag := k[4:]
+				} else if strings.HasPrefix(kCleaned, "tag_") {
+					tag := kCleaned[4:]
 					tags[tag] = fmt.Sprintf("%v", v)
 				} else {
-					fields[k] = v
+					fields[kCleaned] = v
 				}
 			}
 
@@ -1294,10 +1296,11 @@ func SendToGraphite(dbname, measurement string, data [](map[string]interface{}))
 				continue
 			} else {
 				var metric graphite.Metric
-				if strings.HasPrefix(k, "tag_") { // ignore tags for Graphite
-					metric.Name = metric_base_prefix + k[4:]
+				_, kCleaned := DerivePromDataTypeFromColumnNameAndCleanTypeHint(k) // get rid of Prometheus "annotations" if any
+				if strings.HasPrefix(kCleaned, "tag_") {                           // ignore tags for Graphite
+					metric.Name = metric_base_prefix + kCleaned[4:]
 				} else {
-					metric.Name = metric_base_prefix + k
+					metric.Name = metric_base_prefix + kCleaned
 				}
 				switch t := v.(type) {
 				case int:
@@ -1309,7 +1312,7 @@ func SendToGraphite(dbname, measurement string, data [](map[string]interface{}))
 				case float64:
 					metric.Value = fmt.Sprintf("%f", v)
 				default:
-					log.Warning("Invalid type for column:", k, "value:", v, "type:", t)
+					log.Warning("Invalid type for column:", kCleaned, "value:", v, "type:", t)
 					continue
 				}
 				metric.Timestamp = epoch_s
@@ -3128,7 +3131,7 @@ func main() {
 			log.Fatal("Test data generation mode cannot be used with Prometheus data store")
 		}
 
-		StartPrometheusExporter(opts.PrometheusPort)
+		go StartPrometheusExporter(opts.PrometheusPort)
 	} else {
 		log.Fatal("Unknown datastore. Check the --datastore param")
 	}
