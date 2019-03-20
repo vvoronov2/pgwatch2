@@ -10,7 +10,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/shopspring/decimal"
 )
 
 type Exporter struct {
@@ -133,10 +132,6 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 				labels[tag] = fmt.Sprintf("%v", v)
 			} else {
 				dataType := reflect.TypeOf(v).String()
-				log.Error(k, v, dataType)
-				if dataType == "decimal.Decimal" {
-					log.Fatal(decimal.NewFromString(v.(string)))
-				}
 				if dataType == "float64" || dataType == "float32" || dataType == "int64" || dataType == "int32" || dataType == "int" {
 					f, err := strconv.ParseFloat(fmt.Sprintf("%v", v), 64)
 					if err != nil {
@@ -166,14 +161,31 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 			label_keys = append(label_keys, k)
 			label_values = append(label_values, v)
 		}
-		// for all fields a separate metric named: pgwatch2_metricname_columnname
-		for field, value := range fields {
-			fieldPromDataType, cleanedField := DerivePromDataTypeFromColumnNameAndCleanTypeHint(field) // TODO ignore prom_type_gauge/counter for other data sources
-			desc := prometheus.NewDesc(fmt.Sprintf("%s_%s_%s", "pgwatch2", msg.MetricName, cleanedField),
-				msg.MetricName, label_keys, nil)
-			m := prometheus.MustNewConstMetric(desc, fieldPromDataType, value, label_values...) // TODO gauge vs counter
-			promMetrics = append(promMetrics, prometheus.NewMetricWithTimestamp(epoch_time, m))
 
+		for field, value := range fields {
+			skip := false
+			fieldPromDataType := prometheus.CounterValue
+
+			for _, gaugeColumns := range msg.MetricDefinitionDetails.ColumnAttrs.PrometheusGaugeColumns {
+				if gaugeColumns == field {
+					fieldPromDataType = prometheus.GaugeValue
+					break
+				}
+			}
+			for _, ignoredColumns := range msg.MetricDefinitionDetails.ColumnAttrs.PrometheusIgnoredColumns {
+				if ignoredColumns == field {
+					skip = true
+					break
+				}
+			}
+			if skip {
+				continue
+			}
+
+			desc := prometheus.NewDesc(fmt.Sprintf("%s_%s_%s", "pgwatch2", msg.MetricName, field),
+				msg.MetricName, label_keys, nil)
+			m := prometheus.MustNewConstMetric(desc, fieldPromDataType, value, label_values...)
+			promMetrics = append(promMetrics, prometheus.NewMetricWithTimestamp(epoch_time, m))
 		}
 	}
 	return promMetrics
@@ -200,17 +212,4 @@ func StartPrometheusExporter(port int64) {
 		}
 		time.Sleep(time.Second * 5)
 	}
-}
-
-func DerivePromDataTypeFromColumnNameAndCleanTypeHint(field string) (prometheus.ValueType, string) {
-	promType := prometheus.CounterValue // default
-	cleanedField := field
-
-	if strings.Contains(field, "_prom_type_counter") {
-		cleanedField = strings.ReplaceAll(field, "_prom_type_counter", "")
-	} else if strings.Contains(field, "_prom_type_gauge") {
-		promType = prometheus.GaugeValue
-		cleanedField = strings.ReplaceAll(field, "_prom_type_gauge", "")
-	}
-	return promType, cleanedField
 }

@@ -69,10 +69,16 @@ type PresetConfig struct {
 	Metrics     map[string]float64
 }
 
+type MetricColumnAttrs struct {
+	PrometheusGaugeColumns   []string `yaml:"prometheus_gauge_columns"`
+	PrometheusIgnoredColumns []string `yaml:"prometheus_ignored_columns"` // for cases where we don't want some columns to be exposed in Prom mode
+}
+
 type MetricVersionProperties struct {
 	Sql         string
 	MasterOnly  bool
 	StandbyOnly bool
+	ColumnAttrs MetricColumnAttrs // Prometheus Metric Type (Counter is default) and ignore list
 }
 
 type ControlMessage struct {
@@ -89,11 +95,12 @@ type MetricFetchMessage struct {
 }
 
 type MetricStoreMessage struct {
-	DBUniqueName string
-	DBType       string
-	MetricName   string
-	CustomTags   map[string]string
-	Data         [](map[string]interface{})
+	DBUniqueName            string
+	DBType                  string
+	MetricName              string
+	CustomTags              map[string]string
+	Data                    [](map[string]interface{})
+	MetricDefinitionDetails MetricVersionProperties
 }
 
 type MetricStoreMessagePostgres struct {
@@ -622,14 +629,13 @@ retry:
 				if v == nil || v == "" {
 					continue // not storing NULLs
 				}
-				_, kCleaned := DerivePromDataTypeFromColumnNameAndCleanTypeHint(k) // get rid of Prometheus "annotations" if any
-				if kCleaned == EPOCH_COLUMN_NAME {
+				if k == EPOCH_COLUMN_NAME {
 					epoch_ns = v.(int64)
-				} else if strings.HasPrefix(kCleaned, "tag_") {
-					tag := kCleaned[4:]
+				} else if strings.HasPrefix(k, "tag_") {
+					tag := k[4:]
 					tags[tag] = fmt.Sprintf("%v", v)
 				} else {
-					fields[kCleaned] = v
+					fields[k] = v
 				}
 			}
 
@@ -713,14 +719,13 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 				if v == nil || v == "" {
 					continue // not storing NULLs
 				}
-				_, kCleaned := DerivePromDataTypeFromColumnNameAndCleanTypeHint(k) // get rid of Prometheus "annotations" if any
-				if kCleaned == EPOCH_COLUMN_NAME {
+				if k == EPOCH_COLUMN_NAME {
 					epoch_ns = v.(int64)
-				} else if strings.HasPrefix(kCleaned, "tag_") {
-					tag := kCleaned[4:]
+				} else if strings.HasPrefix(k, "tag_") {
+					tag := k[4:]
 					tags[tag] = fmt.Sprintf("%v", v)
 				} else {
-					fields[kCleaned] = v
+					fields[k] = v
 				}
 			}
 
@@ -1296,11 +1301,11 @@ func SendToGraphite(dbname, measurement string, data [](map[string]interface{}))
 				continue
 			} else {
 				var metric graphite.Metric
-				_, kCleaned := DerivePromDataTypeFromColumnNameAndCleanTypeHint(k) // get rid of Prometheus "annotations" if any
-				if strings.HasPrefix(kCleaned, "tag_") {                           // ignore tags for Graphite
-					metric.Name = metric_base_prefix + kCleaned[4:]
+
+				if strings.HasPrefix(k, "tag_") { // ignore tags for Graphite
+					metric.Name = metric_base_prefix + k[4:]
 				} else {
-					metric.Name = metric_base_prefix + kCleaned
+					metric.Name = metric_base_prefix + k
 				}
 				switch t := v.(type) {
 				case int:
@@ -1312,7 +1317,7 @@ func SendToGraphite(dbname, measurement string, data [](map[string]interface{}))
 				case float64:
 					metric.Value = fmt.Sprintf("%f", v)
 				default:
-					log.Warning("Invalid type for column:", kCleaned, "value:", v, "type:", t)
+					log.Warning("Invalid type for column:", k, "value:", v, "type:", t)
 					continue
 				}
 				metric.Timestamp = epoch_s
@@ -2074,7 +2079,7 @@ func FetchMetrics(msg MetricFetchMessage, host_state map[string]map[string]strin
 			if msg.MetricName == "pgbouncer_stats" { // clean unwanted pgbouncer pool stats here as not possible in SQL
 				data = FilterPgbouncerData(data, md.DBName)
 			}
-			return []MetricStoreMessage{MetricStoreMessage{DBUniqueName: msg.DBUniqueName, MetricName: msg.MetricName, Data: data, CustomTags: md.CustomTags}}, nil
+			return []MetricStoreMessage{MetricStoreMessage{DBUniqueName: msg.DBUniqueName, MetricName: msg.MetricName, Data: data, CustomTags: md.CustomTags, MetricDefinitionDetails: mvp}}, nil
 		}
 	}
 	return nil, nil
@@ -2480,6 +2485,22 @@ func ReadPresetMetricsConfigFromFolder(folder string, failOnError bool) (map[str
 	return pmm, err
 }
 
+func ParseMetricColumnAttrsFromYAML(yamlPath string) MetricColumnAttrs {
+	c := MetricColumnAttrs{}
+
+	yamlFile, err := ioutil.ReadFile(yamlPath)
+	if err != nil {
+		log.Errorf("Error reading file %s: %s", yamlFile, err)
+		return c
+	}
+
+	err = yaml.Unmarshal(yamlFile, &c)
+	if err != nil {
+		log.Errorf("Unmarshaling error: %v", err)
+	}
+	return c
+}
+
 // expected is following structure: metric_name/pg_ver/metric.sql
 func ReadMetricsFromFolder(folder string, failOnError bool) (map[string]map[decimal.Decimal]MetricVersionProperties, error) {
 	metrics_map := make(map[string]map[decimal.Decimal]MetricVersionProperties)
@@ -2513,8 +2534,14 @@ func ReadMetricsFromFolder(folder string, failOnError bool) (map[string]map[deci
 				return metrics_map, err
 			}
 
+			var metricColumnAttrs MetricColumnAttrs
+			if _, err = os.Stat(path.Join(folder, f.Name(), "column_attrs.yaml")); err == nil {
+				metricColumnAttrs = ParseMetricColumnAttrsFromYAML(path.Join(folder, f.Name(), "column_attrs.yaml"))
+				log.Debugf("Discovered following column attributes for metric %s: %v", f.Name(), metricColumnAttrs)
+			}
+
 			for _, pgVer := range pgVers {
-				if strings.HasSuffix(pgVer.Name(), ".md") {
+				if strings.HasSuffix(pgVer.Name(), ".md") || pgVer.Name() == "column_attrs.yaml" {
 					continue
 				}
 				if !rIsDigitOrPunctuation.MatchString(pgVer.Name()) {
@@ -2547,7 +2574,8 @@ func ReadMetricsFromFolder(folder string, failOnError bool) (map[string]map[deci
 						if validMetricDefs > 1 {
 							log.Warningf("Multiple definitions found for metric [%s:%s], using the last one (%s)...", f.Name(), pgVer.Name(), md.Name())
 						}
-						mvp := MetricVersionProperties{Sql: string(metric_sql[:])}
+						mvp := MetricVersionProperties{Sql: string(metric_sql[:]), ColumnAttrs: metricColumnAttrs}
+
 						//log.Debugf("Metric definition for \"%s\" ver %s: %s", f.Name(), pgVer.Name(), metric_sql)
 						_, ok := metrics_map[f.Name()]
 						if !ok {
