@@ -65,14 +65,16 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 					nil,
 					CONTEXT_PROMETHEUS_SCRAPE)
 				if err != nil {
-					log.Errorf("failed to fetch [%s:%s]: %v", name, metric, err)
+					log.Errorf("failed to scrape [%s:%s]: %v", name, metric, err)
 					e.totalScrapeFailures.Add(1)
 					lastScrapeErrors++
 					continue
 				}
-				promMetrics := MetricStoreMessageToPromMetrics(metricStoreMessages[0])
-				for _, pm := range promMetrics { // collect & send later in batch? capMetricChan = 1000 limit in prometheus code
-					ch <- pm
+				if len(metricStoreMessages) > 0 {
+					promMetrics := MetricStoreMessageToPromMetrics(metricStoreMessages[0])
+					for _, pm := range promMetrics { // collect & send later in batch? capMetricChan = 1000 limit in prometheus code
+						ch <- pm
+					}
 				}
 			}
 		}
@@ -135,7 +137,7 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 				if dataType == "float64" || dataType == "float32" || dataType == "int64" || dataType == "int32" || dataType == "int" {
 					f, err := strconv.ParseFloat(fmt.Sprintf("%v", v), 64)
 					if err != nil {
-						log.Warningf("Skipping scraping column %s of [%s:%s]: %v", k, msg.DBUniqueName, msg.MetricName, err)
+						log.Debugf("Skipping scraping column %s of [%s:%s]: %v", k, msg.DBUniqueName, msg.MetricName, err)
 					}
 					fields[k] = f
 				} else if dataType == "bool" {
@@ -145,7 +147,8 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 						fields[k] = 0
 					}
 				} else {
-					log.Warningf("Skipping scraping column %s of [%s:%s], unsupported datatype: %s", k, msg.DBUniqueName, msg.MetricName, dataType)
+					log.Debugf("Skipping scraping column %s of [%s:%s], unsupported datatype: %s", k, msg.DBUniqueName, msg.MetricName, dataType)
+					continue
 				}
 			}
 		}
@@ -166,10 +169,14 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 			skip := false
 			fieldPromDataType := prometheus.CounterValue
 
-			for _, gaugeColumns := range msg.MetricDefinitionDetails.ColumnAttrs.PrometheusGaugeColumns {
-				if gaugeColumns == field {
-					fieldPromDataType = prometheus.GaugeValue
-					break
+			if msg.MetricDefinitionDetails.ColumnAttrs.PrometheusAllGaugeColumns {
+				fieldPromDataType = prometheus.GaugeValue
+			} else {
+				for _, gaugeColumns := range msg.MetricDefinitionDetails.ColumnAttrs.PrometheusGaugeColumns {
+					if gaugeColumns == field {
+						fieldPromDataType = prometheus.GaugeValue
+						break
+					}
 				}
 			}
 			for _, ignoredColumns := range msg.MetricDefinitionDetails.ColumnAttrs.PrometheusIgnoredColumns {

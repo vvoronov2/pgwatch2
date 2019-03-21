@@ -70,8 +70,9 @@ type PresetConfig struct {
 }
 
 type MetricColumnAttrs struct {
-	PrometheusGaugeColumns   []string `yaml:"prometheus_gauge_columns"`
-	PrometheusIgnoredColumns []string `yaml:"prometheus_ignored_columns"` // for cases where we don't want some columns to be exposed in Prom mode
+	PrometheusGaugeColumns    []string `yaml:"prometheus_gauge_columns"`
+	PrometheusIgnoredColumns  []string `yaml:"prometheus_ignored_columns"` // for cases where we don't want some columns to be exposed in Prom mode
+	PrometheusAllGaugeColumns bool     `yaml:"prometheus_all_gauge_columns"`
 }
 
 type MetricVersionProperties struct {
@@ -2240,7 +2241,7 @@ func UpdateMetricDefinitionMap(newMetrics map[string]map[decimal.Decimal]MetricV
 
 func ReadMetricDefinitionMapFromPostgres(failOnError bool) (map[string]map[decimal.Decimal]MetricVersionProperties, error) {
 	metric_def_map_new := make(map[string]map[decimal.Decimal]MetricVersionProperties)
-	sql := "select m_name, m_pg_version_from::text, m_sql, m_master_only, m_standby_only from pgwatch2.metric where m_is_active"
+	sql := "select m_name, m_pg_version_from::text, m_sql, m_master_only, m_standby_only, coalesce(m_column_attrs::text, '') as m_column_attrs from pgwatch2.metric where m_is_active"
 
 	log.Info("updating metrics definitons from ConfigDB...")
 	data, err := DBExecRead(configDb, CONFIGDB_IDENT, sql)
@@ -2264,10 +2265,15 @@ func ReadMetricDefinitionMapFromPostgres(failOnError bool) (map[string]map[decim
 			metric_def_map_new[row["m_name"].(string)] = make(map[decimal.Decimal]MetricVersionProperties)
 		}
 		d, _ := decimal.NewFromString(row["m_pg_version_from"].(string))
+		ca := MetricColumnAttrs{}
+		if row["m_column_attrs"].(string) != "" {
+			ca = ParseMetricColumnAttrsFromString(row["m_column_attrs"].(string))
+		}
 		metric_def_map_new[row["m_name"].(string)][d] = MetricVersionProperties{
 			Sql:         row["m_sql"].(string),
 			MasterOnly:  row["m_master_only"].(bool),
 			StandbyOnly: row["m_standby_only"].(bool),
+			ColumnAttrs: ca,
 		}
 	}
 	return metric_def_map_new, err
@@ -2495,6 +2501,16 @@ func ParseMetricColumnAttrsFromYAML(yamlPath string) MetricColumnAttrs {
 	}
 
 	err = yaml.Unmarshal(yamlFile, &c)
+	if err != nil {
+		log.Errorf("Unmarshaling error: %v", err)
+	}
+	return c
+}
+
+func ParseMetricColumnAttrsFromString(jsonAttrs string) MetricColumnAttrs {
+	c := MetricColumnAttrs{}
+
+	err := yaml.Unmarshal([]byte(jsonAttrs), &c)
 	if err != nil {
 		log.Errorf("Unmarshaling error: %v", err)
 	}
@@ -3077,7 +3093,7 @@ func main() {
 	control_channels := make(map[string](chan ControlMessage)) // [db1+metric1]=chan
 	persist_ch := make(chan []MetricStoreMessage, 10000)
 	var buffered_persist_ch chan []MetricStoreMessage
-	if opts.BatchingDelayMs > 0 {
+	if opts.BatchingDelayMs > 0 && opts.Datastore != DATASTORE_PROMETHEUS {
 		buffered_persist_ch = make(chan []MetricStoreMessage, 10000) // "staging area" for metric storage batching, when enabled
 		log.Info("starting MetricsBatcher...")
 		go MetricsBatcher(DATASTORE_INFLUX, opts.BatchingDelayMs, buffered_persist_ch, persist_ch)
