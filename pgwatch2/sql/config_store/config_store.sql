@@ -179,25 +179,22 @@ insert into pgwatch2.preset_config (pc_name, pc_description, pc_config)
     "wal": 60,
     "change_events": 300
     }'),
-    ('prometheus', 'similar to "exhaustive" but without some possibly longer-running metrics and those needing state',
+    ('prometheus', 'similar to "exhaustive" but without some possibly longer-running metrics and those keeping state',
     '{
-    "archiver": 60,
-    "backends": 60,
-    "bgwriter": 60,
-    "cpu_load": 60,
-    "db_stats": 60,
-    "db_size": 300,
-    "index_stats": 600,
-    "locks": 60,
-    "locks_mode": 60,
-    "replication": 120,
-    "replication_slots": 120,
-    "sproc_stats": 180,
-    "stat_statements_calls": 60,
-    "table_io_stats": 180,
-    "table_stats": 180,
-    "wal": 60,
-    "wal_receiver": 120
+    "archiver": 1,
+    "backends": 1,
+    "bgwriter": 1,
+    "cpu_load": 1,
+    "db_stats": 1,
+    "db_size": 1,
+    "locks_mode": 1,
+    "replication": 1,
+    "replication_slots": 1,
+    "sproc_stats": 1,
+    "stat_statements_calls": 1,
+    "table_stats": 1,
+    "wal": 1,
+    "wal_receiver": 1
     }');
 
 /* one host for demo purposes, so that "docker run" could immediately show some graphs */
