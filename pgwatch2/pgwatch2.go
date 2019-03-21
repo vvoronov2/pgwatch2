@@ -2870,11 +2870,11 @@ type Options struct {
 	Password             string `long:"password" description:"PG config DB password" env:"PW2_PGPASSWORD"`
 	PgRequireSSL         string `long:"pg-require-ssl" description:"PG config DB SSL connection only" default:"false" env:"PW2_PGSSL"`
 	Group                string `short:"g" long:"group" description:"Group (or groups, comma separated) for filtering which DBs to monitor. By default all are monitored" env:"PW2_GROUP"`
-	Datastore            string `long:"datastore" description:"[influx|postgres|graphite|json|prometheus]" default:"influx" env:"PW2_DATASTORE"`
+	Datastore            string `long:"datastore" description:"[influx|postgres|prometheus|graphite|json]" default:"influx" env:"PW2_DATASTORE"`
 	PGMetricStoreConnStr string `long:"pg-metric-store-conn-str" description:"PG Metric Store" env:"PW2_PG_METRIC_STORE_CONN_STR"`
 	PGRetentionDays      int64  `long:"pg-retention-days" description:"If set, metrics older than that will be deleted" default:"30" env:"PW2_PG_RETENTION_DAYS"`
-	PrometheusPort       int64  `long:"prometheus-port" description:"9187" default:"9187" env:"PW2_PROMETHEUS_PORT"`
-	//	PrometheusConnStr    string `long:"prometheus-conn-str" description:"PG server to monitor" env:"PW2_PROMETHEUS_CONN_STR"`
+	PrometheusPort       int64  `long:"prometheus-port" description:"Prometheus port. Effective with --datastore=prometheus" default:"9187" env:"PW2_PROMETHEUS_PORT"`
+	PrometheusListenAddr string `long:"prometheus-listen-addr" description:"Network interface to listen on" default:"0.0.0.0" env:"PW2_PROMETHEUS_LISTEN_ADDR"`
 	InfluxHost           string `long:"ihost" description:"Influx host" default:"localhost" env:"PW2_IHOST"`
 	InfluxPort           string `long:"iport" description:"Influx port" default:"8086" env:"PW2_IPORT"`
 	InfluxDbname         string `long:"idbname" description:"Influx DB name" default:"pgwatch2" env:"PW2_IDATABASE"`

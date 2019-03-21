@@ -62,7 +62,8 @@ EXPOSE 8081
 EXPOSE 5432
 # Grafana UI
 EXPOSE 3000
-
+# Prometheus scraping port
+EXPOSE 9187
 
 ### Volumes for easier updating to newer to newer pgwatch2 containers
 ### NB! Backwards compatibility is not 100% guaranteed so a backup

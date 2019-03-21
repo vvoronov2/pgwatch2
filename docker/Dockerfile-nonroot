@@ -80,6 +80,8 @@ EXPOSE 3000
 EXPOSE 8086
 # InfluxDB backup port
 EXPOSE 8088
+# Prometheus scraping port
+EXPOSE 9187
 
 ### Volumes for easier updating to newer to newer pgwatch2 containers
 ### NB! Backwards compatibility is not 100% guaranteed (e.g. InfluxDB has changed index storage format) so a backup

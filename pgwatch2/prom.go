@@ -200,10 +200,10 @@ func StartPrometheusExporter(port int64) {
 
 	prometheus.MustRegister(promExporter)
 
-	var promServer = &http.Server{Addr: fmt.Sprintf(":%d", opts.PrometheusPort), Handler: promhttp.Handler()}
+	var promServer = &http.Server{Addr: fmt.Sprintf("%s:%d", opts.PrometheusListenAddr, opts.PrometheusPort), Handler: promhttp.Handler()}
 
 	for { // ListenAndServe call should not normally return, but looping just in case
-		log.Infof("starting Prometheus exporter on port %d ...", opts.PrometheusPort)
+		log.Infof("starting Prometheus exporter on %s:%d ...", opts.PrometheusListenAddr, opts.PrometheusPort)
 		err = promServer.ListenAndServe()
 		if listenLoops == 0 {
 			log.Fatal("Prometheus listener failure:", err)

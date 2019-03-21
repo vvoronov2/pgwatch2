@@ -21,6 +21,10 @@ RUN wget -q -O /tmp/go.tar.gz https://dl.google.com/go/go1.12.linux-amd64.tar.gz
     && chgrp -R 0 /pgwatch2 \
     && chmod -R g=u /pgwatch2
 
+# pgwatch2 internal status endpoint
+EXPOSE 8081
+# Prometheus metrics scraping port
+EXPOSE 9187
 
 USER 10001
 
