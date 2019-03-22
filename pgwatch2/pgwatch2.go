@@ -2891,6 +2891,7 @@ type Options struct {
 	PGRetentionDays      int64  `long:"pg-retention-days" description:"If set, metrics older than that will be deleted" default:"30" env:"PW2_PG_RETENTION_DAYS"`
 	PrometheusPort       int64  `long:"prometheus-port" description:"Prometheus port. Effective with --datastore=prometheus" default:"9187" env:"PW2_PROMETHEUS_PORT"`
 	PrometheusListenAddr string `long:"prometheus-listen-addr" description:"Network interface to listen on" default:"0.0.0.0" env:"PW2_PROMETHEUS_LISTEN_ADDR"`
+	PrometheusNamespace  string `long:"prometheus-namespace" description:"Prefix for all non-process (thus Postgres) metrics" default:"pgwatch2" env:"PW2_PROMETHEUS_NAMESPACE"`
 	InfluxHost           string `long:"ihost" description:"Influx host" default:"localhost" env:"PW2_IHOST"`
 	InfluxPort           string `long:"iport" description:"Influx port" default:"8086" env:"PW2_IPORT"`
 	InfluxDbname         string `long:"idbname" description:"Influx DB name" default:"pgwatch2" env:"PW2_IDATABASE"`

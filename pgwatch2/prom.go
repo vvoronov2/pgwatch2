@@ -20,17 +20,17 @@ type Exporter struct {
 func NewExporter() (*Exporter, error) {
 	return &Exporter{
 		lastScrapeErrors: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "pgwatch2",
+			Namespace: opts.PrometheusNamespace,
 			Name:      "exporter_last_scrape_errors",
 			Help:      "Last scrape error count for all monitored hosts / metrics",
 		}),
 		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: "pgwatch2",
+			Namespace: opts.PrometheusNamespace,
 			Name:      "exporter_total_scrapes",
 			Help:      "Total scrape attempts.",
 		}),
 		totalScrapeFailures: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: "pgwatch2",
+			Namespace: opts.PrometheusNamespace,
 			Name:      "exporter_total_scrape_failures",
 			Help:      "Number of errors while executing metric queries",
 		}),
@@ -188,9 +188,13 @@ func MetricStoreMessageToPromMetrics(msg MetricStoreMessage) []prometheus.Metric
 			if skip {
 				continue
 			}
-
-			desc := prometheus.NewDesc(fmt.Sprintf("%s_%s_%s", "pgwatch2", msg.MetricName, field),
-				msg.MetricName, label_keys, nil)
+			var desc *prometheus.Desc
+			if opts.PrometheusNamespace != "" {
+				desc = prometheus.NewDesc(fmt.Sprintf("%s_%s_%s", opts.PrometheusNamespace, msg.MetricName, field),
+					msg.MetricName, label_keys, nil)
+			} else {
+				desc = prometheus.NewDesc(fmt.Sprintf("%s_%s", msg.MetricName, field), msg.MetricName, label_keys, nil)
+			}
 			m := prometheus.MustNewConstMetric(desc, fieldPromDataType, value, label_values...)
 			promMetrics = append(promMetrics, prometheus.NewMetricWithTimestamp(epoch_time, m))
 		}
