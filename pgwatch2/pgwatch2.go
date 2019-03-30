@@ -1667,7 +1667,7 @@ func DetectSprocChanges(dbUnique string, db_pg_version decimal.Decimal, storage_
 
 	data, err, _ := DBExecReadByDbUniqueName(dbUnique, "sproc_hashes", useConnPooling, mvp.Sql)
 	if err != nil {
-		log.Error("could not read table_hashes from monitored host: ", dbUnique, ", err:", err)
+		log.Error("could not read sproc_hashes from monitored host: ", dbUnique, ", err:", err)
 		return change_counts
 	}
 
