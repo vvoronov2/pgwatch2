@@ -614,7 +614,7 @@ WHERE
 $sql$
 );
 
-insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_sql_su)
 values (
 'kpi',
 9.6,
@@ -655,12 +655,51 @@ FROM
 WHERE
   datname = current_database();
 $sql$,
-'{"prometheus_gauge_columns": ["numbackends", "active_backends", "blocked_backends", "kpi_oldest_tx_s"]}'
+'{"prometheus_gauge_columns": ["numbackends", "active_backends", "blocked_backends", "kpi_oldest_tx_s"]}',
+$sql$
+WITH q_stat_tables AS (
+  SELECT * FROM pg_stat_user_tables t
+  JOIN pg_class c ON c.oid = t.relid
+  WHERE NOT schemaname LIKE E'pg\\_temp%'
+  AND c.relpages > (1e7 / 8)    -- >10MB
+),
+q_stat_activity AS (
+    SELECT * FROM pg_stat_activity
+    WHERE datname = current_database() AND pid != pg_backend_pid()
+)
+SELECT
+  (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+  (select pg_xlog_location_diff(pg_current_xlog_location(), '0/0'))::int8 AS wal_location_b,
+  numbackends - 1 as numbackends,
+  (select count(*) from q_stat_activity where state in ('active', 'idle in transaction')) AS active_backends,
+  (select count(*) from q_stat_activity where wait_event_type in ('LWLockNamed', 'Lock', 'BufferPin')) AS blocked_backends,
+  (select round(extract(epoch from now()) - extract(epoch from (select xact_start from q_stat_activity
+    where datid = d.datid and not query like 'autovacuum:%' order by xact_start limit 1))))::int AS kpi_oldest_tx_s,
+  xact_commit + xact_rollback AS tps,
+  xact_commit,
+  xact_rollback,
+  blks_read,
+  blks_hit,
+  temp_bytes,
+  (select sum(seq_scan) from q_stat_tables)::int8 AS seq_scans_on_tbls_gt_10mb,
+  tup_inserted,
+  tup_updated,
+  tup_deleted,
+  (select sum(calls) from pg_stat_user_functions where not schemaname like any(array[E'pg\\_%', 'information_schema']))::int8 AS sproc_calls,
+  blk_read_time,
+  blk_write_time,
+  deadlocks,
+  extract(epoch from (now() - pg_postmaster_start_time()))::int8 as postmaster_uptime_s
+FROM
+  pg_stat_database d
+WHERE
+  datname = current_database();
+$sql$
 );
 
 /* kpi */
 
-insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_sql_su)
 values (
 'kpi',
 10,
@@ -701,13 +740,52 @@ FROM
 WHERE
   datname = current_database();
 $sql$,
-'{"prometheus_gauge_columns": ["numbackends", "active_backends", "blocked_backends", "kpi_oldest_tx_s"]}'
+'{"prometheus_gauge_columns": ["numbackends", "active_backends", "blocked_backends", "kpi_oldest_tx_s"]}',
+$sql$
+WITH q_stat_tables AS (
+  SELECT * FROM pg_stat_user_tables t
+  JOIN pg_class c ON c.oid = t.relid
+  WHERE NOT schemaname LIKE E'pg\\_temp%'
+  AND c.relpages > (1e7 / 8)    -- >10MB
+),
+q_stat_activity AS (
+    SELECT * FROM pg_stat_activity
+    WHERE datname = current_database() AND pid != pg_backend_pid()
+)
+SELECT
+  (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+  (select pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0'))::int8 AS wal_location_b,
+  numbackends - 1 as numbackends,
+  (select count(*) from q_stat_activity where state in ('active', 'idle in transaction')) AS active_backends,
+  (select count(*) from q_stat_activity where wait_event_type in ('LWLock', 'Lock', 'BufferPin')) AS blocked_backends,
+  (select round(extract(epoch from now()) - extract(epoch from (select xact_start from q_stat_activity
+    where datid = d.datid and not query like 'autovacuum:%' order by xact_start limit 1))))::int AS kpi_oldest_tx_s,
+  xact_commit + xact_rollback AS tps,
+  xact_commit,
+  xact_rollback,
+  blks_read,
+  blks_hit,
+  temp_bytes,
+  (select sum(seq_scan) from q_stat_tables)::int8 AS seq_scans_on_tbls_gt_10mb,
+  tup_inserted,
+  tup_updated,
+  tup_deleted,
+  (select sum(calls) from pg_stat_user_functions where not schemaname like any(array[E'pg\\_%', 'information_schema']))::int8 AS sproc_calls,
+  blk_read_time,
+  blk_write_time,
+  deadlocks,
+  extract(epoch from (now() - pg_postmaster_start_time()))::int8 as postmaster_uptime_s
+FROM
+  pg_stat_database d
+WHERE
+  datname = current_database();
+$sql$
 );
 
 
 /* replication */
 
-insert into pgwatch2.metric(m_name, m_pg_version_from, m_master_only, m_sql, m_column_attrs)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_master_only, m_sql, m_column_attrs, m_sql_su)
 values (
 'replication',
 9.2,
@@ -726,7 +804,21 @@ SELECT
 from
   get_stat_replication();
 $sql$,
-'{"prometheus_all_gauge_columns": true}'
+'{"prometheus_all_gauge_columns": true}',
+$sql$
+SELECT
+  (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+  application_name as tag_application_name,
+  concat(coalesce(client_addr::text, client_hostname), '_', client_port::text) as tag_client_info,
+  coalesce(pg_xlog_location_diff(pg_current_xlog_location(), write_location)::int8, 0) as write_lag_b,
+  coalesce(pg_xlog_location_diff(pg_current_xlog_location(), flush_location)::int8, 0) as flush_lag_b,
+  coalesce(pg_xlog_location_diff(pg_current_xlog_location(), replay_location)::int8, 0) as replay_lag_b,
+  state,
+  sync_state,
+  case when sync_state in ('sync', 'quorum') then 1 else 0 end as is_sync_int
+from
+  pg_stat_replication
+$sql$
 );
 
 /* replication */
@@ -939,10 +1031,107 @@ $sql$,
 
 /* stat_statements */
 
-insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_sql_su)
 values (
 'stat_statements',
 9.2,
+$sql$
+with q_data as (
+  select
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    queryid::text as tag_queryid,
+    max(ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g')))::varchar(16000) as tag_query,
+    sum(s.calls)::int8 as calls,
+    sum(s.total_time)::double precision as total_time,
+    sum(shared_blks_hit)::int8 as shared_blks_hit,
+    sum(shared_blks_read)::int8 as shared_blks_read,
+    sum(shared_blks_written)::int8 as shared_blks_written,
+    sum(shared_blks_dirtied)::int8 as shared_blks_dirtied,
+    sum(temp_blks_read)::int8 as temp_blks_read,
+    sum(temp_blks_written)::int8 as temp_blks_written,
+    sum(blk_read_time)::double precision as blk_read_time,
+    sum(blk_write_time)::double precision as blk_write_time
+  from
+    get_stat_statements() s
+  where
+    calls > 5
+    and total_time > 0
+    and dbid = (select oid from pg_database where datname = current_database())
+    and not upper(s.query) like any (array['DEALLOCATE%', 'SET %', 'RESET %', 'BEGIN%', 'BEGIN;',
+      'COMMIT%', 'END%', 'ROLLBACK%', 'SHOW%'])
+  group by
+    queryid
+)
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    total_time > 0
+  order by
+    total_time desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  order by
+    calls desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    shared_blks_read > 0
+  order by
+    shared_blks_read desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    shared_blks_written > 0
+  order by
+    shared_blks_written desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    temp_blks_read > 0
+  order by
+    temp_blks_read desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    temp_blks_written > 0
+  order by
+    temp_blks_written desc
+  limit 100
+) a;
+$sql$,
 $sql$
 with q_data as (
   select
@@ -1112,7 +1301,7 @@ $sql$,
 
 
 /* stat_ssl */       -- join with backends?
-insert into pgwatch2.metric(m_name, m_pg_version_from,m_sql)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_sql_su)
 values (
 'stat_ssl',
 9.5,
@@ -1129,6 +1318,20 @@ WHERE
   AND a.datname = current_database()
 GROUP BY
   1, 2
+$sql$,
+$sql$
+SELECT
+(extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+ssl,
+count(*)
+    FROM
+  pg_stat_ssl AS s,
+pg_stat_activity AS a
+WHERE
+  a.pid = s.pid
+  AND a.datname = current_database()
+GROUP BY
+  1, 2;
 $sql$
 );
 
@@ -1610,7 +1813,7 @@ true
 );
 
 /* approx. bloat summary */
-insert into pgwatch2.metric(m_name, m_pg_version_from, m_master_only, m_sql, m_column_attrs)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_master_only, m_sql, m_column_attrs, m_sql_su)
 values (
 'table_bloat_approx_summary',
 9.5,
@@ -1627,11 +1830,39 @@ from
 where
   approx_free_space > 0
 $sql$,
-'{"prometheus_all_gauge_columns": true}'
+'{"prometheus_all_gauge_columns": true}',
+$sql$
+with table_bloat_approx as (
+    select
+        avg(approx_free_percent)::double precision as approx_free_percent,
+        sum(approx_free_space)::double precision as approx_free_space,
+        avg(dead_tuple_percent)::double precision as dead_tuple_percent,
+        sum(dead_tuple_len)::double precision as dead_tuple_len
+    from
+        pg_class c
+            join
+        pg_namespace n on n.oid = c.relnamespace
+            join lateral pgstattuple_approx(c.oid) on (c.oid not in (select relation from pg_locks where mode = 'AccessExclusiveLock'))  -- skip locked tables
+    where
+        relkind in ('r', 'm')
+        and c.relpages >= 128 -- tables >1mb
+        and not n.nspname like any (array[E'pg\\_%', 'information_schema'])
+)
+select
+  (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+  approx_free_percent,
+  approx_free_space as approx_free_space_b,
+  dead_tuple_percent,
+  dead_tuple_len as dead_tuple_len_b
+from
+  table_bloat_approx
+where
+  approx_free_space > 0;
+$sql$
 );
 
 /* approx. bloat summary pure SQL estimate */
-insert into pgwatch2.metric(m_name, m_pg_version_from, m_master_only, m_sql, m_column_attrs)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_master_only, m_sql, m_column_attrs, m_sql_su)
 values (
 'table_bloat_approx_summary_sql',
 9.0,
@@ -1646,7 +1877,263 @@ SELECT
     ((select sum(approx_bloat_bytes) from q_bloat) * 100 / pg_database_size(current_database()))::int8 as approx_bloat_percentage
 ;
 $sql$,
-'{"prometheus_all_gauge_columns": true}'
+'{"prometheus_all_gauge_columns": true}',
+$sql$
+WITH q_bloat AS (
+    SELECT
+                quote_ident(schemaname)||'.'||quote_ident(tblname) as full_table_name,
+                bloat_ratio as approx_bloat_percent,
+                bloat_size as approx_bloat_bytes,
+                fillfactor
+    FROM (
+
+/* WARNING: executed with a non-superuser role, the query inspect only tables you are granted to read.
+* This query is compatible with PostgreSQL 9.0 and more
+*/
+             SELECT current_database(),
+                    schemaname,
+                    tblname,
+                    bs * tblpages                  AS real_size,
+                    (tblpages - est_tblpages) * bs AS extra_size,
+                    CASE
+                        WHEN tblpages - est_tblpages > 0
+                            THEN 100 * (tblpages - est_tblpages) / tblpages::float
+                        ELSE 0
+                        END                        AS extra_ratio,
+                    fillfactor,
+                    CASE
+                        WHEN tblpages - est_tblpages_ff > 0
+                            THEN (tblpages - est_tblpages_ff) * bs
+                        ELSE 0
+                        END                        AS bloat_size,
+                    CASE
+                        WHEN tblpages - est_tblpages_ff > 0
+                            THEN 100 * (tblpages - est_tblpages_ff) / tblpages::float
+                        ELSE 0
+                        END                        AS bloat_ratio,
+                    is_na
+                    -- , (pst).free_percent + (pst).dead_tuple_percent AS real_frag
+             FROM (
+                      SELECT ceil(reltuples / ((bs - page_hdr) / tpl_size)) + ceil(toasttuples / 4)                      AS est_tblpages,
+                             ceil(reltuples / ((bs - page_hdr) * fillfactor / (tpl_size * 100))) +
+                             ceil(toasttuples / 4)                                                                       AS est_tblpages_ff,
+                             tblpages,
+                             fillfactor,
+                             bs,
+                             tblid,
+                             schemaname,
+                             tblname,
+                             heappages,
+                             toastpages,
+                             is_na
+                             -- , stattuple.pgstattuple(tblid) AS pst
+                      FROM (
+                               SELECT (4 + tpl_hdr_size + tpl_data_size + (2 * ma)
+                                   - CASE WHEN tpl_hdr_size % ma = 0 THEN ma ELSE tpl_hdr_size % ma END
+                                   - CASE
+                                         WHEN ceil(tpl_data_size)::int % ma = 0 THEN ma
+                                         ELSE ceil(tpl_data_size)::int % ma END
+                                          )                    AS tpl_size,
+                                      bs - page_hdr            AS size_per_block,
+                                      (heappages + toastpages) AS tblpages,
+                                      heappages,
+                                      toastpages,
+                                      reltuples,
+                                      toasttuples,
+                                      bs,
+                                      page_hdr,
+                                      tblid,
+                                      schemaname,
+                                      tblname,
+                                      fillfactor,
+                                      is_na
+                               FROM (
+                                        SELECT tbl.oid                                                           AS tblid,
+                                               ns.nspname                                                        AS schemaname,
+                                               tbl.relname                                                       AS tblname,
+                                               tbl.reltuples,
+                                               tbl.relpages                                                      AS heappages,
+                                               coalesce(toast.relpages, 0)                                       AS toastpages,
+                                               coalesce(toast.reltuples, 0)                                      AS toasttuples,
+                                               coalesce(substring(
+                                                                array_to_string(tbl.reloptions, ' ')
+                                                                FROM 'fillfactor=([0-9]+)')::smallint,
+                                                        100)                                                     AS fillfactor,
+                                               current_setting('block_size')::numeric                            AS bs,
+                                               CASE
+                                                   WHEN version() ~ 'mingw32' OR version() ~ '64-bit|x86_64|ppc64|ia64|amd64'
+                                                       THEN 8
+                                                   ELSE 4 END                                                    AS ma,
+                                               24                                                                AS page_hdr,
+                                               23 + CASE
+                                                        WHEN MAX(coalesce(null_frac, 0)) > 0 THEN (7 + count(*)) / 8
+                                                        ELSE 0::int END
+                                                   +
+                                               CASE WHEN tbl.relhasoids THEN 4 ELSE 0 END                        AS tpl_hdr_size,
+                                               sum((1 - coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024)) AS tpl_data_size,
+                                               bool_or(att.atttypid = 'pg_catalog.name'::regtype)
+                                                   OR count(att.attname) <> count(s.attname)                     AS is_na
+                                        FROM pg_attribute AS att
+                                                 JOIN pg_class AS tbl ON att.attrelid = tbl.oid
+                                                 JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+                                                 LEFT JOIN pg_stats AS s ON s.schemaname = ns.nspname
+                                            AND s.tablename = tbl.relname AND s.inherited = false AND
+                                                                            s.attname = att.attname
+                                                 LEFT JOIN pg_class AS toast ON tbl.reltoastrelid = toast.oid
+                                        WHERE att.attnum > 0
+                                          AND NOT att.attisdropped
+                                          AND tbl.relkind IN ('r', 'm')
+                                          AND ns.nspname != 'information_schema'
+                                        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, tbl.relhasoids
+                                        ORDER BY 2, 3
+                                    ) AS s
+                           ) AS s2
+                  ) AS s3
+             -- WHERE NOT is_na
+         ) s4
+)
+SELECT
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    (select sum(approx_bloat_bytes) from q_bloat) as approx_table_bloat_b,
+    ((select sum(approx_bloat_bytes) from q_bloat) * 100 / pg_database_size(current_database()))::int8 as approx_bloat_percentage;
+$sql$
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_master_only, m_sql, m_column_attrs, m_sql_su)
+values (
+'table_bloat_approx_summary_sql',
+12,
+true,
+$sql$
+WITH q_bloat AS (
+    select * from get_table_bloat_approx_sql()
+)
+SELECT
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    (select sum(approx_bloat_bytes) from q_bloat) as approx_table_bloat_b,
+    ((select sum(approx_bloat_bytes) from q_bloat) * 100 / pg_database_size(current_database()))::int8 as approx_bloat_percentage
+;
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+$sql$,
+WITH q_bloat AS (
+    SELECT quote_ident(schemaname) || '.' || quote_ident(tblname) as full_table_name,
+           bloat_ratio                                            as approx_bloat_percent,
+           bloat_size                                             as approx_bloat_bytes,
+           fillfactor
+    FROM (
+
+/* WARNING: executed with a non-superuser role, the query inspect only tables you are granted to read.
+* This query is compatible with PostgreSQL 9.0 and more
+*/
+             SELECT current_database(),
+                    schemaname,
+                    tblname,
+                    bs * tblpages                  AS real_size,
+                    (tblpages - est_tblpages) * bs AS extra_size,
+                    CASE
+                        WHEN tblpages - est_tblpages > 0
+                            THEN 100 * (tblpages - est_tblpages) / tblpages::float
+                        ELSE 0
+                        END                        AS extra_ratio,
+                    fillfactor,
+                    CASE
+                        WHEN tblpages - est_tblpages_ff > 0
+                            THEN (tblpages - est_tblpages_ff) * bs
+                        ELSE 0
+                        END                        AS bloat_size,
+                    CASE
+                        WHEN tblpages - est_tblpages_ff > 0
+                            THEN 100 * (tblpages - est_tblpages_ff) / tblpages::float
+                        ELSE 0
+                        END                        AS bloat_ratio,
+                    is_na
+                    -- , (pst).free_percent + (pst).dead_tuple_percent AS real_frag
+             FROM (
+                      SELECT ceil(reltuples / ((bs - page_hdr) / tpl_size)) + ceil(toasttuples / 4) AS est_tblpages,
+                             ceil(reltuples / ((bs - page_hdr) * fillfactor / (tpl_size * 100))) +
+                             ceil(toasttuples / 4)                                                  AS est_tblpages_ff,
+                             tblpages,
+                             fillfactor,
+                             bs,
+                             tblid,
+                             schemaname,
+                             tblname,
+                             heappages,
+                             toastpages,
+                             is_na
+                             -- , stattuple.pgstattuple(tblid) AS pst
+                      FROM (
+                               SELECT (4 + tpl_hdr_size + tpl_data_size + (2 * ma)
+                                   - CASE WHEN tpl_hdr_size % ma = 0 THEN ma ELSE tpl_hdr_size % ma END
+                                   - CASE
+                                         WHEN ceil(tpl_data_size)::int % ma = 0 THEN ma
+                                         ELSE ceil(tpl_data_size)::int % ma END
+                                          )                    AS tpl_size,
+                                      bs - page_hdr            AS size_per_block,
+                                      (heappages + toastpages) AS tblpages,
+                                      heappages,
+                                      toastpages,
+                                      reltuples,
+                                      toasttuples,
+                                      bs,
+                                      page_hdr,
+                                      tblid,
+                                      schemaname,
+                                      tblname,
+                                      fillfactor,
+                                      is_na
+                               FROM (
+                                        SELECT tbl.oid                                                           AS tblid,
+                                               ns.nspname                                                        AS schemaname,
+                                               tbl.relname                                                       AS tblname,
+                                               tbl.reltuples,
+                                               tbl.relpages                                                      AS heappages,
+                                               coalesce(toast.relpages, 0)                                       AS toastpages,
+                                               coalesce(toast.reltuples, 0)                                      AS toasttuples,
+                                               coalesce(substring(
+                                                                array_to_string(tbl.reloptions, ' ')
+                                                                FROM 'fillfactor=([0-9]+)')::smallint,
+                                                        100)                                                     AS fillfactor,
+                                               current_setting('block_size')::numeric                            AS bs,
+                                               CASE
+                                                   WHEN version() ~ 'mingw32' OR version() ~ '64-bit|x86_64|ppc64|ia64|amd64'
+                                                       THEN 8
+                                                   ELSE 4 END                                                    AS ma,
+                                               24                                                                AS page_hdr,
+                                               23 + CASE
+                                                        WHEN MAX(coalesce(null_frac, 0)) > 0 THEN (7 + count(*)) / 8
+                                                        ELSE 0::int END
+                                                   +
+                                               0                                                                 AS tpl_hdr_size,
+                                               sum((1 - coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024)) AS tpl_data_size,
+                                               bool_or(att.atttypid = 'pg_catalog.name'::regtype)
+                                                   OR
+                                               count(att.attname) <> count(s.attname)                            AS is_na
+                                        FROM pg_attribute AS att
+                                                 JOIN pg_class AS tbl ON att.attrelid = tbl.oid
+                                                 JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+                                                 LEFT JOIN pg_stats AS s ON s.schemaname = ns.nspname
+                                            AND s.tablename = tbl.relname AND s.inherited = false AND
+                                                                            s.attname = att.attname
+                                                 LEFT JOIN pg_class AS toast ON tbl.reltoastrelid = toast.oid
+                                        WHERE att.attnum > 0
+                                          AND NOT att.attisdropped
+                                          AND tbl.relkind IN ('r', 'm')
+                                          AND ns.nspname != 'information_schema'
+                                        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+                                        ORDER BY 2, 3
+                                    ) AS s
+                           ) AS s2
+                  ) AS s3
+             -- WHERE NOT is_na
+         ) s4
+)
+SELECT
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    (select sum(approx_bloat_bytes) from q_bloat) as approx_table_bloat_b,
+    ((select sum(approx_bloat_bytes) from q_bloat) * 100 / pg_database_size(current_database()))::int8 as approx_bloat_percentage;
+$sql$
 );
 
 /* "parent" setting for all of the below "*_hashes" metrics. only this parent "change_events" metric should be used in configs! */
@@ -2090,7 +2577,7 @@ values (
 $sql$$sql$
 );
 
-insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_sql_su)
 values (
 'wal_size',
 10,
@@ -2099,7 +2586,13 @@ select
   (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
   get_wal_size() as wal_size_b;
 $sql$,
-'{"prometheus_all_gauge_columns": true}'
+'{"prometheus_all_gauge_columns": true}',
+$sql$
+select
+  (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+   (sum((pg_stat_file('pg_wal/' || name)).size))::int8 as wal_size_b
+from pg_ls_waldir();
+$sql$
 );
 
 
