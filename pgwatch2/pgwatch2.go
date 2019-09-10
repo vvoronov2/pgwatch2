@@ -1677,7 +1677,11 @@ func DBGetPGVersion(dbUnique string, noCache bool) (DBVersionMapEntry, error) {
 			)[1]::text as ver, pg_is_in_recovery(), current_database()::text;
 	`
 	sql_sysid := `select system_identifier::text from pg_control_system();`
-	sql_su := `select rolsuper from pg_roles where rolname = session_user;`		// TODO pg_monitor
+	sql_su := `select rolsuper or exists (
+				 select * from pg_catalog.pg_auth_members m
+				 join pg_catalog.pg_roles b on (m.roleid = b.oid)
+        		 where m.member = r.oid and b.rolname = 'rds_superuser') as rolsuper
+			   from pg_roles r where rolname = session_user;`
 
 	db_pg_version_map_lock.RLock()
 	ver, ok = db_pg_version_map[dbUnique]
@@ -2396,7 +2400,7 @@ func UpdateMetricDefinitionMap(newMetrics map[string]map[decimal.Decimal]MetricV
 
 func ReadMetricDefinitionMapFromPostgres(failOnError bool) (map[string]map[decimal.Decimal]MetricVersionProperties, error) {
 	metric_def_map_new := make(map[string]map[decimal.Decimal]MetricVersionProperties)
-	sql := "select m_name, m_pg_version_from::text, m_sql, m_master_only, m_standby_only, coalesce(m_column_attrs::text, '') as m_column_attrs from pgwatch2.metric where m_is_active"
+	sql := "select m_name, m_pg_version_from::text, m_sql, m_master_only, m_standby_only, coalesce(m_column_attrs::text, '') as m_column_attrs, m_sql_su from pgwatch2.metric where m_is_active"
 
 	log.Info("updating metrics definitons from ConfigDB...")
 	data, err := DBExecRead(configDb, CONFIGDB_IDENT, sql)
@@ -2426,6 +2430,7 @@ func ReadMetricDefinitionMapFromPostgres(failOnError bool) (map[string]map[decim
 		}
 		metric_def_map_new[row["m_name"].(string)][d] = MetricVersionProperties{
 			Sql:         row["m_sql"].(string),
+			SqlSU:       row["m_sql_su"].(string),
 			MasterOnly:  row["m_master_only"].(bool),
 			StandbyOnly: row["m_standby_only"].(bool),
 			ColumnAttrs: ca,

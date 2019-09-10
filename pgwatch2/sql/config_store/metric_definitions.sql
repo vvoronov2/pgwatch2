@@ -2015,7 +2015,7 @@ SELECT
 ;
 $sql$,
 '{"prometheus_all_gauge_columns": true}',
-$sql$,
+$sql$
 WITH q_bloat AS (
     SELECT quote_ident(schemaname) || '.' || quote_ident(tblname) as full_table_name,
            bloat_ratio                                            as approx_bloat_percent,
