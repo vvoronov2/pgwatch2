@@ -76,6 +76,7 @@ create table metric (
     m_master_only bool default false,
     m_standby_only bool default false,
     m_column_attrs      jsonb,  -- currently only useful for Prometheus
+    m_sql_su            text default '',
 
     unique (m_name, m_pg_version_from),
     check (not (m_master_only and m_standby_only)),
