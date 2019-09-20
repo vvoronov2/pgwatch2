@@ -3140,6 +3140,11 @@ type Options struct {
 	SystemIdentifierField     string `long:"system-identifier-field" description:"Tag key for system identifier value if --add-system-identifier" env:"PW2_SYSTEM_IDENTIFIER_FIELD" default:"sys_id"`
 	ServersRefreshLoopSeconds int    `long:"servers-refresh-loop-seconds" description:"Sleep time for the main loop" env:"PW2_SERVERS_REFRESH_LOOP_SECONDS" default:"120"`
 	Version                   bool   `long:"version" description:"Show Git build version and exit" env:"PW2_VERSION"`
+	Logparse                  bool   `long:"logparse" description:"Only 'tail' logs for errors and send to metrics DB'" env:"PW2_LOGPARSE"`
+	LogparseMetric            bool   `long:"server_log" description:"Name of measurement / table to store 'tailed' event counts'" env:"PW2_LOGPARSE"`
+	Globpath                  string `long:"globpath" description:"For finding logfiles to parse'" env:"PW2_GLOBPATH" default:""`
+	MinLogSeverity            string `long:"min-log-severity" description:"Dismiss events with lesser severity" env:"PW2_MIN_LOG_SEVERITY" default:""`
+
 }
 
 var opts Options
@@ -3169,6 +3174,14 @@ func main() {
 	logging.SetFormatter(logging.MustStringFormatter(`%{level:.4s} %{shortfunc}: %{message}`))
 
 	log.Debug("opts", opts)
+
+	if opts.Logparse {
+		if opts.Globpath == "" {
+			log.Fatal("--globpath needs to be set for --logparse mode")
+		}
+		log.Info("Entering logparse mode, no regular metrics gathering will be performed ")
+		logparseLoop()
+	}
 
 	if opts.ServersRefreshLoopSeconds <= 1 {
 		log.Fatal("--servers-refresh-loop-seconds must be greater than 1")
