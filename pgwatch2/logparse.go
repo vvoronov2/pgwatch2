@@ -138,7 +138,7 @@ var PG_SEVERITIES = [...]string{"DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1"
 
 func SeverityIsGreaterOrEqualTo(severity, threshold string) bool {
 	thresholdPassed := false
-	for i, s := range PG_SEVERITIES {
+	for _, s := range PG_SEVERITIES {
 		if s == threshold {
 			thresholdPassed = true
 			break
@@ -183,8 +183,8 @@ func logparseLoop() {
 
 		result := RegexMatchesToMap(csvlogRegex, matches)
 		// log.Fatal(result)
-		if severity, ok := result["error_severity"] ; ok && SeverityIsGreaterOrEqualTo(severity, PG_SEVERITIES) {
-			log.Warning(serv)
+		if severity, ok := result["error_severity"] ; ok && SeverityIsGreaterOrEqualTo(severity, "WARNING") {
+			log.Warning(severity)
 		}
 
 
@@ -247,6 +247,9 @@ func logparseLoop() {
 
 func RegexMatchesToMap(csvlogRegex *regexp.Regexp, matches []string) map[string]string {
 	result := make(map[string]string)
+	if matches == nil || len(matches) == 0 || csvlogRegex == nil {
+		return result
+	}
 	for i, name := range csvlogRegex.SubexpNames() {
 		if i != 0 && name != "" {
 			result[name] = matches[i]
