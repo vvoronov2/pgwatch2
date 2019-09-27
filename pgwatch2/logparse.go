@@ -20,7 +20,7 @@ var logFilesToTailLock = sync.RWMutex{}
 var lastParsedLineTimestamp time.Time
 
 const DEFAULT_LOG_SEVERITY = "WARNING"
-const CSVLOG_DEFAULT_REGEX  = `^(?P<log_time>.*?),"?(?P<user_name>.*?)"?,"?(?P<database_name>.*?)"?,(?P<process_id>\d+),"(?P<connection_from>.*?)",(?P<session_id>.*?),(?P<session_line_num>\d+),"(?P<command_tag>.*?)",(?P<session_start_time>.*?),(?P<virtual_transaction_id>.*?),(?P<transaction_id>.*?),(?P<error_severity>\w+),`
+const CSVLOG_DEFAULT_REGEX  = `^^(?P<log_time>.*?),"?(?P<user_name>.*?)"?,"?(?P<database_name>.*?)"?,(?P<process_id>\d+),"?(?P<connection_from>.*?)"?,(?P<session_id>.*?),(?P<session_line_num>\d+),"?(?P<command_tag>.*?)"?,(?P<session_start_time>.*?),(?P<virtual_transaction_id>.*?),(?P<transaction_id>.*?),(?P<error_severity>\w+),`
 
 // https://www.reddit.com/r/golang/comments/60ck9o/why_is_it_hard_to_mimic_tail_f_behavior/
 //http://satran.in/2017/11/15/Implementing_tails_follow_in_go.html
@@ -310,7 +310,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 			}
 			//time.Sleep(time.Duration(metricInterval) * 1e9)
 		}
-		panic("ok 20")
+		//panic("ok 20")
 	}
 
 	for {
