@@ -79,6 +79,9 @@ type HostConfigAttrs struct {
 	CAFile       string `yaml:"ca_file"`
 	CertFile     string `yaml:"cert_file"`
 	KeyFile      string `yaml:"key_file"`
+	LogsGlobPath string `yaml:"logs_glob_path"`		    // default $data_directory / $log_directory / *.csvlog
+	LogsMinSeverity string `yaml:"logs_min_severity"`	// default WARNING
+    LogsMatchRegex string `yaml:logs_match_regex`		// default is for CSVLOG format
 }
 
 type PatroniClusterMember struct {
@@ -191,6 +194,7 @@ const DBTYPE_PG_CONT = "postgres-continuous-discovery"
 const DBTYPE_BOUNCER = "pgbouncer"
 const DBTYPE_PATRONI = "patroni"
 const DBTYPE_PATRONI_CONT = "patroni-continuous-discovery"
+const POSTGRESQL_LOG_PARSING_METRIC_NAME = "postgresql_log_error_counts"
 
 var dbTypeMap = map[string]bool{DBTYPE_PG: true, DBTYPE_PG_CONT: true, DBTYPE_BOUNCER: true, DBTYPE_PATRONI: true, DBTYPE_PATRONI_CONT: true}
 var dbTypes = []string{DBTYPE_PG, DBTYPE_PG_CONT, DBTYPE_BOUNCER, DBTYPE_PATRONI, DBTYPE_PATRONI_CONT} // used for informational purposes
@@ -2296,6 +2300,12 @@ func MetricGathererLoop(dbUniqueName, dbType, metricName string, config_map map[
 		if err != nil {
 			log.Errorf("Could not add newly found gatherer [%s:%s] to the 'all_distinct_dbname_metrics' listing table: %v", dbUniqueName, metricName, err)
 		}
+
+		EnsureMetricDummy(metricName) // ensure that there is at least an empty top-level table not to get ugly Grafana notifications
+	}
+
+	if metricName == POSTGRESQL_LOG_PARSING_METRIC_NAME {
+		logparseLoop(dbUniqueName, metricName, config_map, control_ch, store_ch)		// no return
 	}
 
 	for {
@@ -2376,10 +2386,6 @@ func MetricGathererLoop(dbUniqueName, dbType, metricName string, config_map map[
 			} else {
 				StoreMetrics(metricStoreMessages, store_ch)
 			}
-		}
-
-		if opts.Datastore == DATASTORE_POSTGRES {
-			EnsureMetricDummy(metricName) // ensure that there is at least an empty top-level table not to ugly Grafana notifications
 		}
 
 		if opts.TestdataDays > 0 { // covers errors & no data
@@ -3140,10 +3146,6 @@ type Options struct {
 	SystemIdentifierField     string `long:"system-identifier-field" description:"Tag key for system identifier value if --add-system-identifier" env:"PW2_SYSTEM_IDENTIFIER_FIELD" default:"sys_id"`
 	ServersRefreshLoopSeconds int    `long:"servers-refresh-loop-seconds" description:"Sleep time for the main loop" env:"PW2_SERVERS_REFRESH_LOOP_SECONDS" default:"120"`
 	Version                   bool   `long:"version" description:"Show Git build version and exit" env:"PW2_VERSION"`
-	Logparse                  bool   `long:"logparse" description:"Only 'tail' logs for errors and send to metrics DB'" env:"PW2_LOGPARSE"`
-	LogparseMetric            bool   `long:"server_log" description:"Name of measurement / table to store 'tailed' event counts'" env:"PW2_LOGPARSE"`
-	Globpath                  string `long:"globpath" description:"For finding logfiles to parse'" env:"PW2_GLOBPATH" default:""`
-	MinLogSeverity            string `long:"min-log-severity" description:"Dismiss events with lesser severity" env:"PW2_MIN_LOG_SEVERITY" default:""`
 
 }
 
@@ -3174,14 +3176,6 @@ func main() {
 	logging.SetFormatter(logging.MustStringFormatter(`%{level:.4s} %{shortfunc}: %{message}`))
 
 	log.Debug("opts", opts)
-
-	if opts.Logparse {
-		if opts.Globpath == "" {
-			log.Fatal("--globpath needs to be set for --logparse mode")
-		}
-		log.Info("Entering logparse mode, no regular metrics gathering will be performed ")
-		logparseLoop()
-	}
 
 	if opts.ServersRefreshLoopSeconds <= 1 {
 		log.Fatal("--servers-refresh-loop-seconds must be greater than 1")
