@@ -161,10 +161,11 @@ func SeverityIsGreaterOrEqualTo(severity, threshold string) bool {
 // TODO control_ch
 func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64, control_ch <-chan ControlMessage, store_ch chan<- []MetricStoreMessage) {
 
-	var latest string
+	var latest, previous string
 	var latestHandle *os.File
 	var reader *bufio.Reader
 	var latestModTime time.Time
+	var linesRead = 0							// to skip over already parsed lines on Postgres server restart for example
     var logsMatchRegex, logsGlobPath, logsMinSeverity string
 	var lastSendTime time.Time               // to storage channel
 	var lastConfigRefreshTime time.Time      // MonitoredDatabase info
@@ -242,7 +243,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 			} else {
 				latest = globMatches[0]
 			}
-			log.Info("Starting to parse logfile: %s ", latest)
+			log.Infof("[%s] Starting to parse logfile: %s ", dbUniqueName, latest)
 		}
 
 		// TODO stat + seek
@@ -254,6 +255,24 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				continue
 			}
 			reader = bufio.NewReader(latestHandle)
+			if previous == latest && linesRead > 0 {
+				i := 1
+				for i <= linesRead {
+					_, err = reader.ReadString('\n')
+					if err == io.EOF && i < linesRead {	// truncated probably ??
+						log.Warningf("[%s] Failed to open logfile %s: %s. Sleeping 60s...", dbUniqueName, latest, err)
+						linesRead = 0
+						break
+					} else if err != nil {
+						log.Warningf("[%s] Failed to skip %d logfile lines for %s, there might be duplicates reported. Error: %s", dbUniqueName, linesRead, latest, err)
+						time.Sleep(60 * time.Second)
+						linesRead = i
+						break
+					}
+					i++
+				}
+				log.Debug("[%s] Skipped %d already processed lines from %s", dbUniqueName, linesRead, latest)
+			}
 		}
 
 		var eofSleepMillis = 0
@@ -275,7 +294,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 			}
 
 			if err == io.EOF {
-				log.Debugf("[%s] EOF reached for logfile %s", dbUniqueName, latest)
+				//log.Debugf("[%s] EOF reached for logfile %s", dbUniqueName, latest)
 				if eofSleepMillis < 5000 {
 					eofSleepMillis += 500	// progressive backoff till 5s
 				}
@@ -283,6 +302,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				// new file detection
 				file, mod := getFileWithNextModTimestamp(globMatches, latest, latestModTime)
 				if file != "" {
+					previous = latest
 					latest = file
 					latestModTime = mod
 					err = latestHandle.Close()
@@ -290,13 +310,15 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 						log.Warningf("[%s] Failed to close logfile %s: %s", dbUniqueName, latest, err)
 					}
 					log.Info("Switching to new logfile", file, mod)
+					linesRead = 0
 				} else {
-					log.Debugf("No newer logfiles found. Sleeping %v ms...", eofSleepMillis)
+					//log.Debugf("No newer logfiles found. Sleeping %v ms...", eofSleepMillis)
 					time.Sleep(time.Millisecond * time.Duration(eofSleepMillis))	// progressively sleep more if nothing going on
 				}
 				continue
 			} else {
 				eofSleepMillis = 0
+				linesRead++
 			}
 
 			matches := csvlogRegex.FindStringSubmatch(line)
@@ -304,7 +326,6 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				log.Warningf("[%s] No logline regex match for line", line) // normal case actually, for multiline
 				continue
 			}
-			log.Info("matches", matches)
 
 			result := RegexMatchesToMap(csvlogRegex, matches)
 			log.Debug("RegexMatchesToMap", result)
@@ -315,10 +336,10 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				continue
 			}
 			if SeverityIsGreaterOrEqualTo(severity, logsMinSeverity) {
-				log.Debug("found matching log line")
-				log.Debug(line)
+				//log.Debug("found matching log line")
+				//log.Debug(line)
+				eventCounts[severity]++
 			}
-			eventCounts[severity]++
 
 			metricInterval, _ := config_map[POSTGRESQL_LOG_PARSING_METRIC_NAME] // TODO what if changes?
 			if lastSendTime.IsZero() || lastSendTime.Before(time.Now().Add(-1 * time.Second * time.Duration(metricInterval))) {
