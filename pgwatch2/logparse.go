@@ -158,29 +158,37 @@ func SeverityIsGreaterOrEqualTo(severity, threshold string) bool {
 	return false
 }
 
+// TODO control_ch
 func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64, control_ch <-chan ControlMessage, store_ch chan<- []MetricStoreMessage) {
 
 	var latest string
+	var latestHandle *os.File
+	var reader *bufio.Reader
 	var latestModTime time.Time
-	var firstFile bool = true
     var logsMatchRegex, logsGlobPath, logsMinSeverity string
-	var lastSendTime time.Time	// to storage channel
-	var eventCounts = make(map[string]int64)	// [WARNING: 34, ERROR: 10, ...], re-created on storage send
+	var lastSendTime time.Time               // to storage channel
+	var lastConfigRefreshTime time.Time      // MonitoredDatabase info
+	var eventCounts = make(map[string]int64) // [WARNING: 34, ERROR: 10, ...], re-created on storage send
+	var mdb MonitoredDatabase
+	var hostConfig HostConfigAttrs
+	var err error
 
-	for {
+	for {	// re-try loop. re-start in case of FS errors or just to refresh host config
 
-		mdb, err := GetMonitoredDatabaseByUniqueName(dbUniqueName)
-		if err != nil {
-			log.Error(err)
-			time.Sleep(60 * time.Second)
-			continue
+		if lastConfigRefreshTime.IsZero() ||  lastConfigRefreshTime.Add(time.Second*time.Duration(opts.ServersRefreshLoopSeconds)).Before(time.Now()) {
+			mdb, err = GetMonitoredDatabaseByUniqueName(dbUniqueName)
+			if err != nil {
+				log.Error(err)
+				time.Sleep(60 * time.Second)
+				continue
+			}
+			hostConfig = mdb.HostConfig	// TODO after ServersRefreshLoopSeconds
+			log.Debugf("[%s] hostConfig: %+v", dbUniqueName, hostConfig)
 		}
-		hostConfig := mdb.HostConfig
-		log.Errorf("hostConfig: %+v", hostConfig)
 
 		logsMatchRegex = hostConfig.LogsMatchRegex
 		if logsMatchRegex == "" {
-			log.Info("Setting default regex")
+			log.Infof("[%s] Setting default logparse regex", dbUniqueName)
 			logsMatchRegex = CSVLOG_DEFAULT_REGEX
 		}
 		logsGlobPath = hostConfig.LogsGlobPath
@@ -196,12 +204,12 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 		logsMinSeverity = hostConfig.LogsMinSeverity
 		if logsMinSeverity == "" {
 			logsMinSeverity = DEFAULT_LOG_SEVERITY
-			log.Info("[%s] Using default min. log severity (%s) as host_config.logs_min_severity not specified", dbUniqueName, DEFAULT_LOG_SEVERITY)
+			log.Infof("[%s] Using default min. log severity (%s) as host_config.logs_min_severity not specified", dbUniqueName, DEFAULT_LOG_SEVERITY)
 		} else {
 			_, ok := PG_SEVERITIES_MAP[logsMinSeverity]
 			if !ok {
 				logsMinSeverity = DEFAULT_LOG_SEVERITY
-				log.Info("[%s] Invalid logs_min_severity (%s) specified, using default min. log severity: %s", dbUniqueName, hostConfig.LogsMinSeverity, DEFAULT_LOG_SEVERITY)
+				log.Infof("[%s] Invalid logs_min_severity (%s) specified, using default min. log severity: %s", dbUniqueName, hostConfig.LogsMinSeverity, DEFAULT_LOG_SEVERITY)
 			} else {
 				log.Debugf("[%s] Configured logs min. error_severity: %s", dbUniqueName, logsMinSeverity)
 			}
@@ -212,76 +220,88 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 		log.Debugf("[%s] Considering log files determined by glob pattern: %s", dbUniqueName, logsGlobPath)
 		globMatches, err := filepath.Glob(logsGlobPath)
 		if err != nil {
-			log.Warning("No logfiles found to parse. Sleeping 5s...")
-			time.Sleep(5 * time.Second)
+			log.Infof("[%s] No logfiles found to parse. Sleeping 60s...", dbUniqueName)
+			time.Sleep(60 * time.Second)
 			continue
 		}
 
 		// set up inotify TODO
 		// kuidas saab hakkama weekly recyclega ?
-		if firstFile {
-			log.Debugf("Found %v logfiles to parse", len(globMatches))
+		if latest == "" {
+			log.Debugf("[%s] Found %v logfiles from glob pattern, picking the latest", dbUniqueName, len(globMatches))
 			if len(globMatches) > 1 {
 				// find latest timestamp
 				latest, latestModTime = getFileWithLatestTimestamp(globMatches)
 				if latest == "" {
-					log.Warning("Could not determine the latest logfile. Sleeping 10s...")
-					time.Sleep(10 * time.Second)
+					log.Warningf("[%s] Could not determine the latest logfile. Sleeping 60s...")
+					time.Sleep(60 * time.Second)
 					continue
 				}
 
-				log.Info("Latest logfile: %s (%v)", latest, latestModTime)
-				logFilesToTail <- latest
-				firstFile = false
+				//logFilesToTail <- latest
 			} else {
 				latest = globMatches[0]
 			}
-
-		} else {
-			file, mod := getFileWithNextModTimestamp(globMatches, latest, latestModTime)
-			if file != "" {
-				latest = file
-				latestModTime = mod
-				log.Info("Switching to new logfile", file, mod)
-				logFilesToTail <- file	// TODO spawn tailer or self?
-			} else {
-				log.Debug("No newer logfiles found...")
-			}
+			log.Info("Starting to parse logfile: %s ", latest)
 		}
 
 		// TODO stat + seek
-		logFile, err := os.Open(latest)
-		if err != nil {
-			panic(err)
-		}
-		defer logFile.Close()
-
-		r := bufio.NewReader(logFile)
-		i:=0
-		var eofSleepMillis int = 0
-
-		for i < 20 {
-			line, err := r.ReadString('\n')
-			if err != nil && err != io.EOF {
-				panic(err)
+		if latestHandle == nil {
+			latestHandle, err = os.Open(latest)
+			if err != nil {
+				log.Warningf("[%s] Failed to open logfile %s: %s. Sleeping 60s...", dbUniqueName, latest, err)
+				time.Sleep(60 * time.Second)
+				continue
 			}
-			i++
+			reader = bufio.NewReader(latestHandle)
+		}
+
+		var eofSleepMillis = 0
+		readLoopStart := time.Now()
+
+		for  {
+			if readLoopStart.Add(time.Second * time.Duration(opts.ServersRefreshLoopSeconds)).Before(time.Now()) {
+				break	// refresh config
+			}
+			line, err := reader.ReadString('\n')
+			if err != nil && err != io.EOF {
+				log.Warningf("[%s] Failed to read logfile %s: %s. Sleeping 60s...", dbUniqueName, latest, err)
+				err = latestHandle.Close()
+				if err != nil {
+					log.Warningf("[%s] Failed to close logfile %s: %s", dbUniqueName, latest, err)
+				}
+				time.Sleep(60 * time.Second)
+				continue
+			}
 
 			if err == io.EOF {
-				log.Debug("EOF reached for ", latest)
-				if eofSleepMillis < 1000 {
-					eofSleepMillis += 100
+				log.Debugf("[%s] EOF reached for logfile %s", dbUniqueName, latest)
+				if eofSleepMillis < 5000 {
+					eofSleepMillis += 500	// progressive backoff till 5s
 				}
-				time.Sleep(time.Millisecond * time.Duration(eofSleepMillis))	// progressively sleep more if nothing going on
+
+				// new file detection
+				file, mod := getFileWithNextModTimestamp(globMatches, latest, latestModTime)
+				if file != "" {
+					latest = file
+					latestModTime = mod
+					err = latestHandle.Close()
+					if err != nil {
+						log.Warningf("[%s] Failed to close logfile %s: %s", dbUniqueName, latest, err)
+					}
+					log.Info("Switching to new logfile", file, mod)
+				} else {
+					log.Debugf("No newer logfiles found. Sleeping %v ms...", eofSleepMillis)
+					time.Sleep(time.Millisecond * time.Duration(eofSleepMillis))	// progressively sleep more if nothing going on
+				}
 				continue
-				// TODO new file detection
 			} else {
 				eofSleepMillis = 0
 			}
 
 			matches := csvlogRegex.FindStringSubmatch(line)
 			if len(matches) == 0 {
-				log.Warning("No logline regex match for line", line) // normal case actually, for multiline
+				log.Warningf("[%s] No logline regex match for line", line) // normal case actually, for multiline
 				continue
 			}
 			log.Info("matches", matches)
@@ -295,8 +315,8 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				continue
 			}
 			if SeverityIsGreaterOrEqualTo(severity, logsMinSeverity) {
-				log.Info("found matching log line")
-				log.Info(line)
+				log.Debug("found matching log line")
+				log.Debug(line)
 			}
 			eventCounts[severity]++
 
@@ -308,76 +328,11 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				eventCounts = make(map[string]int64)
 				lastSendTime = time.Now()
 			}
-			//time.Sleep(time.Duration(metricInterval) * 1e9)
-		}
+
+		}	// file read loop
 		//panic("ok 20")
-	}
+	}	// config loop
 
-	for {
-		//log.Info("Considering log files determined by glob pattern:", logsGlobPath)
-		//matches, err := filepath.Glob(logsGlobPath)
-		//if err != nil {
-		//	log.Warning("No logfiles found to parse. Sleeping 5s...")
-		//	time.Sleep(5 * time.Second)
-		//	continue
-		//}
-
-		//// set up inotify TODO
-		//// kuidas saab hakkama weekly recyclega ?
-		//if firstFile {
-		//	log.Debugf("Found %v logfiles to parse", len(matches))
-		//	if len(matches) > 1 {
-		//		// find latest timestamp
-		//		latest, latestModTime = getFileWithLatestTimestamp(matches)
-		//		if latest == "" {
-		//			log.Warning("Could not determine the latest logfile. Sleeping 10s...")
-		//			time.Sleep(10 * time.Second)
-		//			continue
-		//		}
-		//
-		//		log.Debugf("Latest logfile: %s (%v)", latest, latestModTime)
-		//		logFilesToTail <- latest
-		//		firstFile = false
-		//	}
-		//
-		//} else {
-		//	file, mod := getFileWithNextModTimestamp(matches, latest, latestModTime)
-		//	if file != "" {
-		//		latest = file
-		//		latestModTime = mod
-		//		log.Info("Switching to new logfile", file, mod)
-		//		logFilesToTail <- file
-		//	} else {
-		//		log.Debug("No newer logfiles found...")
-		//	}
-		//}
-
-		//logFilesToTailLock.Lock()
-
-		// TODO
-		//select {
-		//case msg := <-control_ch:
-		//	log.Debug("got control msg", dbUniqueName, metricName, msg)
-		//	if msg.Action == GATHERER_STATUS_START {
-		//		config = msg.Config
-		//		interval = config[metricName]
-		//		if ticker != nil {
-		//			ticker.Stop()
-		//		}
-		//		ticker = time.NewTicker(time.Millisecond * time.Duration(interval*1000))
-		//		log.Debug("started MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
-		//	} else if msg.Action == GATHERER_STATUS_STOP {
-		//		log.Debug("exiting MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
-		//		return
-		//	}
-		//case <-ticker.C:
-		//	log.Debugf("MetricGathererLoop for [%s:%s] slept for %s", dbUniqueName, metricName, time.Second*time.Duration(interval))
-		//}
-
-		time.Sleep(5 * time.Second)
-
-		//os.Exit(0)
-	}
 }
 
 func tryDetermineLogFolder(dbUnique string) string {
