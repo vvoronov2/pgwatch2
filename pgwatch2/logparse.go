@@ -47,9 +47,15 @@ func getFileWithLatestTimestamp(files []string) (string, time.Time) {
 	return latest, maxDate
 }
 
-func getFileWithNextModTimestamp(files []string, currentFile string) (string, time.Time) {
+func getFileWithNextModTimestamp(dbUniqueName, logsGlobPath, currentFile string) (string, time.Time) {
 	var nextFile string
 	var nextMod time.Time
+
+	files, err := filepath.Glob(logsGlobPath)
+	if err != nil {
+		log.Error("[%s] Error globbing \"%s\"...", dbUniqueName, logsGlobPath)
+		return "", time.Now()
+	}
 
 	fiCurrent, err := os.Stat(currentFile)
 	if err != nil {
@@ -256,16 +262,18 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 		csvlogRegex := regexp.MustCompile(logsMatchRegex)	// TODO err handling
 
 		log.Debugf("[%s] Considering log files determined by glob pattern: %s", dbUniqueName, logsGlobPath)
-		globMatches, err := filepath.Glob(logsGlobPath)
-		if err != nil {
-			log.Infof("[%s] No logfiles found to parse. Sleeping 60s...", dbUniqueName)
-			time.Sleep(60 * time.Second)
-			continue
-		}
 
 		// set up inotify TODO
 		// kuidas saab hakkama weekly recyclega ?
-		if latest == "" {
+		if latest == "" || firstRun {
+
+			globMatches, err := filepath.Glob(logsGlobPath)
+			if err != nil || len(globMatches) == 0 {
+				log.Infof("[%s] No logfiles found to parse. Sleeping 60s...", dbUniqueName)
+				time.Sleep(60 * time.Second)
+				continue
+			}
+
 			log.Debugf("[%s] Found %v logfiles from glob pattern, picking the latest", dbUniqueName, len(globMatches))
 			if len(globMatches) > 1 {
 				// find latest timestamp
@@ -277,13 +285,13 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				}
 
 				//logFilesToTail <- latest
-			} else {
+			} else if len(globMatches) == 1  {
 				latest = globMatches[0]
 			}
 			log.Infof("[%s] Starting to parse logfile: %s ", dbUniqueName, latest)
 		}
 
-		// TODO stat + seek
+		log.Error("latestHandle", latestHandle)
 		if latestHandle == nil {
 			latestHandle, err = os.Open(latest)
 			if err != nil {
@@ -327,8 +335,9 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				log.Warningf("[%s] Failed to read logfile %s: %s. Sleeping 60s...", dbUniqueName, latest, err)
 				err = latestHandle.Close()
 				if err != nil {
-					log.Warningf("[%s] Failed to close logfile %s: %s", dbUniqueName, latest, err)
+					log.Warningf("[%s] Failed to close logfile %s properly: %s", dbUniqueName, latest, err)
 				}
+				latestHandle = nil
 				time.Sleep(60 * time.Second)
 				break
 			}
@@ -336,22 +345,27 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 			if err == io.EOF {
 				//log.Debugf("[%s] EOF reached for logfile %s", dbUniqueName, latest)
 				if eofSleepMillis < 5000 {
-					eofSleepMillis += 1000	// progressive backoff till 5s
+					eofSleepMillis += 1000	// progressively sleep more if nothing going on
 				}
-				log.Debugf("[%s] No newer logfiles found. Sleeping %v ms...", dbUniqueName, eofSleepMillis)
-				time.Sleep(time.Millisecond * time.Duration(eofSleepMillis))	// progressively sleep more if nothing going on
+				time.Sleep(time.Millisecond * time.Duration(eofSleepMillis))
 
 				// check for newly opened logfiles
-				file, _ := getFileWithNextModTimestamp(globMatches, latest)
+				file, _ := getFileWithNextModTimestamp(dbUniqueName, logsGlobPath, latest)
 				if file != "" {
 					previous = latest
 					latest = file
 					err = latestHandle.Close()
+					log.Errorf("latestHandle %+v", latestHandle)
+					log.Error("latestHandle == nil", latestHandle == nil)
 					if err != nil {
-						log.Warningf("[%s] Failed to close logfile %s: %s", dbUniqueName, latest, err)
+						log.Warningf("[%s] Failed to close logfile %s properly: %s", dbUniqueName, latest, err)
 					}
-					log.Infof("[%s] Switching to new logfile: %s", dbUniqueName, file)
+					latestHandle = nil
+					log.Errorf("[%s] Switching to new logfile: %s", dbUniqueName, file)
 					linesRead = 0
+					break
+				} else {
+					log.Debugf("[%s] No newer logfiles found. Sleeping %v ms...", dbUniqueName, eofSleepMillis)
 				}
 				//continue
 			} else {
@@ -359,11 +373,12 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				linesRead++
 			}
 
-			if err != io.EOF {
+			if err == nil && line != "" {
 
 				matches := csvlogRegex.FindStringSubmatch(line)
 				if len(matches) == 0 {
-					log.Warningf("[%s] No logline regex match for line", line) // normal case actually, for multiline
+					log.Warningf("[%s] No logline regex match for line:", dbUniqueName) // normal case actually, for multiline
+					log.Warningf(line)
 					continue
 				}
 
