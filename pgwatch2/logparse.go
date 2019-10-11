@@ -41,25 +41,34 @@ func getFileWithLatestTimestamp(files []string) (string, time.Time) {
 		}
 		if fi.ModTime().After(maxDate) {
 			latest = f
+			maxDate = fi.ModTime()
 		}
 	}
 	return latest, maxDate
 }
 
-func getFileWithNextModTimestamp(files []string, file string, fileMod time.Time) (string, time.Time) {
+func getFileWithNextModTimestamp(files []string, currentFile string) (string, time.Time) {
 	var nextFile string
 	var nextMod time.Time
 
+	fiCurrent, err := os.Stat(currentFile)
+	if err != nil {
+		log.Errorf("Failed to stat() currentFile %s: %s", currentFile, err)
+		return "", time.Now()
+	}
+	//log.Debugf("Stat().ModTime() for %s: %v", currentFile, fiCurrent.ModTime())
+
 	for _, f := range files {
-		if f == file {
+		if f == currentFile {
 			continue
 		}
 		fi, err := os.Stat(f)
 		if err != nil {
-			log.Errorf("Failed to stat() file %s: %s", f, err)
+			log.Errorf("Failed to stat() currentFile %s: %s", f, err)
 			continue
 		}
-		if nextMod.IsZero() || fi.ModTime().Before(nextMod) {
+		//log.Debugf("Stat().ModTime() for %s: %v", f, fi.ModTime())
+		if (nextMod.IsZero() || fi.ModTime().Before(nextMod)) && fi.ModTime().After(fiCurrent.ModTime()) {
 			nextMod = fi.ModTime()
 			nextFile = f
 		}
@@ -177,6 +186,7 @@ func eventCountsToMetricStoreMessages(eventCounts map[string]int64, logsMinSever
 			allSeverityCounts[strings.ToLower(s)] = 0
 		}
 	}
+	allSeverityCounts["epoch_ns"] = time.Now().UnixNano()
 	var data []map[string]interface{}
 	data = append(data, allSeverityCounts)
 	return []MetricStoreMessage{{DBUniqueName: mdb.DBUniqueName, DBType: mdb.DBType,
@@ -191,7 +201,6 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 	var latest, previous string
 	var latestHandle *os.File
 	var reader *bufio.Reader
-	var latestModTime time.Time
 	var linesRead = 0							// to skip over already parsed lines on Postgres server restart for example
     var logsMatchRegex, logsGlobPath, logsMinSeverity string
 	var lastSendTime time.Time               // to storage channel
@@ -260,7 +269,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 			log.Debugf("[%s] Found %v logfiles from glob pattern, picking the latest", dbUniqueName, len(globMatches))
 			if len(globMatches) > 1 {
 				// find latest timestamp
-				latest, latestModTime = getFileWithLatestTimestamp(globMatches)
+				latest, _ = getFileWithLatestTimestamp(globMatches)
 				if latest == "" {
 					log.Warningf("[%s] Could not determine the latest logfile. Sleeping 60s...")
 					time.Sleep(60 * time.Second)
@@ -321,55 +330,56 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 					log.Warningf("[%s] Failed to close logfile %s: %s", dbUniqueName, latest, err)
 				}
 				time.Sleep(60 * time.Second)
-				continue
+				break
 			}
 
 			if err == io.EOF {
 				//log.Debugf("[%s] EOF reached for logfile %s", dbUniqueName, latest)
 				if eofSleepMillis < 5000 {
-					eofSleepMillis += 500	// progressive backoff till 5s
+					eofSleepMillis += 1000	// progressive backoff till 5s
 				}
+				log.Debugf("[%s] No newer logfiles found. Sleeping %v ms...", dbUniqueName, eofSleepMillis)
+				time.Sleep(time.Millisecond * time.Duration(eofSleepMillis))	// progressively sleep more if nothing going on
 
-				// new file detection
-				file, mod := getFileWithNextModTimestamp(globMatches, latest, latestModTime)
+				// check for newly opened logfiles
+				file, _ := getFileWithNextModTimestamp(globMatches, latest)
 				if file != "" {
 					previous = latest
 					latest = file
-					latestModTime = mod
 					err = latestHandle.Close()
 					if err != nil {
 						log.Warningf("[%s] Failed to close logfile %s: %s", dbUniqueName, latest, err)
 					}
-					log.Info("Switching to new logfile", file, mod)
+					log.Infof("[%s] Switching to new logfile: %s", dbUniqueName, file)
 					linesRead = 0
-				} else {
-					//log.Debugf("No newer logfiles found. Sleeping %v ms...", eofSleepMillis)
-					time.Sleep(time.Millisecond * time.Duration(eofSleepMillis))	// progressively sleep more if nothing going on
 				}
-				continue
+				//continue
 			} else {
 				eofSleepMillis = 0
 				linesRead++
 			}
 
-			matches := csvlogRegex.FindStringSubmatch(line)
-			if len(matches) == 0 {
-				log.Warningf("[%s] No logline regex match for line", line) // normal case actually, for multiline
-				continue
-			}
+			if err != io.EOF {
 
-			result := RegexMatchesToMap(csvlogRegex, matches)
-			log.Debug("RegexMatchesToMap", result)
-			severity, ok := result["error_severity"]
-			_, valid_severity := PG_SEVERITIES_MAP[severity]
-			if !ok || !valid_severity {
-				log.Warningf("Invalid logline error_severity (%s), ignoring line: %s", severity, line) // normal case actually, for multiline
-				continue
-			}
-			if SeverityIsGreaterOrEqualTo(severity, logsMinSeverity) {
-				//log.Debug("found matching log line")
-				//log.Debug(line)
-				eventCounts[severity]++
+				matches := csvlogRegex.FindStringSubmatch(line)
+				if len(matches) == 0 {
+					log.Warningf("[%s] No logline regex match for line", line) // normal case actually, for multiline
+					continue
+				}
+
+				result := RegexMatchesToMap(csvlogRegex, matches)
+				log.Debug("RegexMatchesToMap", result)
+				severity, ok := result["error_severity"]
+				_, valid_severity := PG_SEVERITIES_MAP[severity]
+				if !ok || !valid_severity {
+					log.Warningf("Invalid logline error_severity (%s), ignoring line: %s", severity, line) // normal case actually, for multiline
+					continue
+				}
+				if SeverityIsGreaterOrEqualTo(severity, logsMinSeverity) {
+					//log.Debug("found matching log line")
+					//log.Debug(line)
+					eventCounts[severity]++
+				}
 			}
 
 			metricInterval, _ := config_map[POSTGRESQL_LOG_PARSING_METRIC_NAME] // TODO what if changes?
