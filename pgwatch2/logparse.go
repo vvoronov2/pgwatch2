@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"regexp"
+	"strings"
 
 	//	"encoding/csv"
 	"github.com/hpcloud/tail"
@@ -18,6 +19,8 @@ import (
 var logFilesToTail = make(chan string, 10000) // main loop adds, worker fetches
 var logFilesToTailLock = sync.RWMutex{}
 var lastParsedLineTimestamp time.Time
+var PG_SEVERITIES = [...]string{"DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "INFO", "NOTICE", "WARNING", "ERROR", "LOG", "FATAL", "PANIC"}
+var PG_SEVERITIES_MAP = map[string]int{"DEBUG5": 1, "DEBUG4": 2, "DEBUG3": 3, "DEBUG2": 4, "DEBUG1": 5, "INFO": 6, "NOTICE": 7, "WARNING": 8, "ERROR": 9, "LOG": 10, "FATAL": 11, "PANIC": 12}
 
 const DEFAULT_LOG_SEVERITY = "WARNING"
 const CSVLOG_DEFAULT_REGEX  = `^^(?P<log_time>.*?),"?(?P<user_name>.*?)"?,"?(?P<database_name>.*?)"?,(?P<process_id>\d+),"?(?P<connection_from>.*?)"?,(?P<session_id>.*?),(?P<session_line_num>\d+),"?(?P<command_tag>.*?)"?,(?P<session_start_time>.*?),(?P<virtual_transaction_id>.*?),(?P<transaction_id>.*?),(?P<error_severity>\w+),`
@@ -137,8 +140,6 @@ type Client struct { // Our example struct, you can use "-" to ignore a field
 	application_name       string `csv:"application_name"`
 }
 
-var PG_SEVERITIES = [...]string{"DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "INFO", "NOTICE", "WARNING", "ERROR", "LOG", "FATAL", "PANIC"}
-var PG_SEVERITIES_MAP = map[string]int{"DEBUG5": 1, "DEBUG4": 2, "DEBUG3": 3, "DEBUG2": 4, "DEBUG1": 5, "INFO": 6, "NOTICE": 7, "WARNING": 8, "ERROR": 9, "LOG": 10, "FATAL": 11, "PANIC": 12}
 
 func SeverityIsGreaterOrEqualTo(severity, threshold string) bool {
 	thresholdPassed := false
@@ -158,6 +159,32 @@ func SeverityIsGreaterOrEqualTo(severity, threshold string) bool {
 	return false
 }
 
+func eventCountsToMetricStoreMessages(eventCounts map[string]int64, logsMinSeverity string, mdb MonitoredDatabase) []MetricStoreMessage {
+	thresholdPassed := false
+	allSeverityCounts := make(map[string]interface{})
+
+	for _, s := range PG_SEVERITIES {
+		if s == logsMinSeverity {
+			thresholdPassed = true
+		}
+		if !thresholdPassed {
+			continue
+		}
+		parsedCount, ok := eventCounts[s]
+		if ok {
+			allSeverityCounts[strings.ToLower(s)] = parsedCount
+		} else {
+			allSeverityCounts[strings.ToLower(s)] = 0
+		}
+	}
+	var data []map[string]interface{}
+	data = append(data, allSeverityCounts)
+	return []MetricStoreMessage{{DBUniqueName: mdb.DBUniqueName, DBType: mdb.DBType,
+			MetricName: POSTGRESQL_LOG_PARSING_METRIC_NAME, Data: data, CustomTags: mdb.CustomTags}}
+}
+
+
+
 // TODO control_ch
 func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64, control_ch <-chan ControlMessage, store_ch chan<- []MetricStoreMessage) {
 
@@ -173,6 +200,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 	var mdb MonitoredDatabase
 	var hostConfig HostConfigAttrs
 	var err error
+	var firstRun = true
 
 	for {	// re-try loop. re-start in case of FS errors or just to refresh host config
 
@@ -255,11 +283,11 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				continue
 			}
 			reader = bufio.NewReader(latestHandle)
-			if previous == latest && linesRead > 0 {
+			if previous == latest && linesRead > 0 {	// handle postmaster restarts
 				i := 1
 				for i <= linesRead {
 					_, err = reader.ReadString('\n')
-					if err == io.EOF && i < linesRead {	// truncated probably ??
+					if err == io.EOF && i < linesRead {
 						log.Warningf("[%s] Failed to open logfile %s: %s. Sleeping 60s...", dbUniqueName, latest, err)
 						linesRead = 0
 						break
@@ -272,6 +300,9 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 					i++
 				}
 				log.Debug("[%s] Skipped %d already processed lines from %s", dbUniqueName, linesRead, latest)
+			} else if firstRun {	// seek to end
+				latestHandle.Seek(0, 2)
+				firstRun = false
 			}
 		}
 
@@ -343,9 +374,9 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 
 			metricInterval, _ := config_map[POSTGRESQL_LOG_PARSING_METRIC_NAME] // TODO what if changes?
 			if lastSendTime.IsZero() || lastSendTime.Before(time.Now().Add(-1 * time.Second * time.Duration(metricInterval))) {
-				log.Warning("Sending sending logparse data to storage channel...")	// TODO
-				// eventCounts -> metric frame
-				log.Error("Sending eventcounts", eventCounts)
+				log.Debugf("[%s] Sending log event counts for last interval to storage channel. Eventcounts: %+v", dbUniqueName, eventCounts)
+				metricStoreMessages := eventCountsToMetricStoreMessages(eventCounts, logsMinSeverity, mdb)
+				store_ch <- metricStoreMessages
 				eventCounts = make(map[string]int64)
 				lastSendTime = time.Now()
 			}
