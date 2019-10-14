@@ -196,7 +196,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 
 		logsMatchRegex = hostConfig.LogsMatchRegex
 		if logsMatchRegex == "" {
-			log.Infof("[%s] Setting default logparse regex", dbUniqueName)
+			log.Debugf("[%s] Setting default logparse regex", dbUniqueName)
 			logsMatchRegex = CSVLOG_DEFAULT_REGEX
 		}
 		logsGlobPath = hostConfig.LogsGlobPath
@@ -338,8 +338,8 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 
 				matches := csvlogRegex.FindStringSubmatch(line)
 				if len(matches) == 0 {
-					log.Warningf("[%s] No logline regex match for line:", dbUniqueName) // normal case actually, for multiline
-					log.Warningf(line)
+					log.Debugf("[%s] No logline regex match for line:", dbUniqueName) // normal case actually, for multiline
+					log.Debugf(line)
 					continue
 				}
 
