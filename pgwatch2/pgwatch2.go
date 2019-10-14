@@ -81,7 +81,7 @@ type HostConfigAttrs struct {
 	KeyFile      string `yaml:"key_file"`
 	LogsGlobPath string `yaml:"logs_glob_path"`		    // default $data_directory / $log_directory / *.csvlog
 	LogsMinSeverity string `yaml:"logs_min_severity"`	// default WARNING
-    LogsMatchRegex string `yaml:logs_match_regex`		// default is for CSVLOG format
+    LogsMatchRegex string `yaml:"logs_match_regex"`		// default is for CSVLOG format
 }
 
 type PatroniClusterMember struct {

@@ -154,7 +154,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 	var latestHandle *os.File
 	var reader *bufio.Reader
 	var linesRead = 0							// to skip over already parsed lines on Postgres server restart for example
-    var logsMatchRegex, logsGlobPath, logsMinSeverity string
+    var logsMatchRegex, logsMatchRegexPrev, logsGlobPath, logsMinSeverity string
 	var lastSendTime time.Time               // to storage channel
 	var lastConfigRefreshTime time.Time      // MonitoredDatabase info
 	var eventCounts = make(map[string]int64) // [WARNING: 34, ERROR: 10, ...], re-created on storage send
@@ -164,6 +164,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 	var interval float64
 	var err error
 	var firstRun = true
+	var csvlogRegex *regexp.Regexp
 
 	for {	// re-try loop. re-start in case of FS errors or just to refresh host config
 		select {
@@ -223,7 +224,17 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 			}
 		}
 
-		csvlogRegex := regexp.MustCompile(logsMatchRegex)	// TODO err handling
+		if logsMatchRegexPrev != logsMatchRegex {	// avoid regex recompile if no changes
+			csvlogRegex, err = regexp.Compile(logsMatchRegex)
+			if err != nil {
+				log.Errorf("[%s] Invalid regex: %s", dbUniqueName, logsMatchRegex)
+				time.Sleep(60 * time.Second)
+				continue
+			} else {
+				log.Error("changing regex to", logsMatchRegex)
+				logsMatchRegexPrev = logsMatchRegex
+			}
+		}
 
 		log.Debugf("[%s] Considering log files determined by glob pattern: %s", dbUniqueName, logsGlobPath)
 
