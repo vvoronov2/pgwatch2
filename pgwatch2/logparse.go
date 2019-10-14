@@ -291,7 +291,6 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 			log.Infof("[%s] Starting to parse logfile: %s ", dbUniqueName, latest)
 		}
 
-		log.Error("latestHandle", latestHandle)
 		if latestHandle == nil {
 			latestHandle, err = os.Open(latest)
 			if err != nil {
@@ -355,12 +354,10 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 					previous = latest
 					latest = file
 					err = latestHandle.Close()
-					log.Errorf("latestHandle %+v", latestHandle)
-					log.Error("latestHandle == nil", latestHandle == nil)
+					latestHandle = nil
 					if err != nil {
 						log.Warningf("[%s] Failed to close logfile %s properly: %s", dbUniqueName, latest, err)
 					}
-					latestHandle = nil
 					log.Errorf("[%s] Switching to new logfile: %s", dbUniqueName, file)
 					linesRead = 0
 					break
