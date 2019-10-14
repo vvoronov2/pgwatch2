@@ -5,8 +5,6 @@ import (
 	"regexp"
 	"strings"
 
-	//	"encoding/csv"
-	"github.com/hpcloud/tail"
 	"io"
 
 	//	"io"
@@ -25,9 +23,31 @@ var PG_SEVERITIES_MAP = map[string]int{"DEBUG5": 1, "DEBUG4": 2, "DEBUG3": 3, "D
 const DEFAULT_LOG_SEVERITY = "WARNING"
 const CSVLOG_DEFAULT_REGEX  = `^^(?P<log_time>.*?),"?(?P<user_name>.*?)"?,"?(?P<database_name>.*?)"?,(?P<process_id>\d+),"?(?P<connection_from>.*?)"?,(?P<session_id>.*?),(?P<session_line_num>\d+),"?(?P<command_tag>.*?)"?,(?P<session_start_time>.*?),(?P<virtual_transaction_id>.*?),(?P<transaction_id>.*?),(?P<error_severity>\w+),`
 
-// https://www.reddit.com/r/golang/comments/60ck9o/why_is_it_hard_to_mimic_tail_f_behavior/
-//http://satran.in/2017/11/15/Implementing_tails_follow_in_go.html
-// TODO ignore all entries older than now() so that no state is required
+type Client struct { // Our example struct, you can use "-" to ignore a field
+	log_time               string `csv:"log_time"`
+	user_name              string `csv:"user_name"`
+	database_name          string `csv:"database_name"`
+	process_id             string `csv:"process_id"`
+	connection_from        string `csv:"connection_from"`
+	session_id             string `csv:"session_id"`
+	session_line_num       string `csv:"session_line_num"`
+	command_tag            string `csv:"command_tag"`
+	session_start_time     string `csv:"session_start_time"`
+	virtual_transaction_id string `csv:"virtual_transaction_id"`
+	transaction_id         string `csv:"transaction_id"`
+	error_severity         string `csv:"error_severity"`
+	sql_state_code         string `csv:"sql_state_code"`
+	message                string `csv:"message"`
+	detail                 string `csv:"detail"`
+	hint                   string `csv:"hint"`
+	internal_query         string `csv:"internal_query"`
+	internal_query_pos     string `csv:"internal_query_pos"`
+	context                string `csv:"context"`
+	query                  string `csv:"query"`
+	query_pos              string `csv:"query_pos"`
+	location               string `csv:"location"`
+	application_name       string `csv:"application_name"`
+}
 
 func getFileWithLatestTimestamp(files []string) (string, time.Time) {
 	var maxDate time.Time
@@ -81,80 +101,6 @@ func getFileWithNextModTimestamp(dbUniqueName, logsGlobPath, currentFile string)
 	}
 	return nextFile, nextMod
 }
-
-func tailer() {
-	var curFile string
-	var lines int
-	var firstFile bool = true
-
-	for {
-		log.Debug("Waiting for files to tail...")
-		if len(logFilesToTail) > 0 {
-			curFile = <-logFilesToTail
-		} else {
-			if firstFile {
-				time.Sleep(1 * time.Second)
-				continue
-			}
-		}
-		if curFile == "" {
-			log.Fatal("curFile empty")
-		}
-		log.Debugf("Tailing %s", curFile)
-		t, err := tail.TailFile(curFile, tail.Config{Follow: true, ReOpen: true, Logger: tail.DiscardingLogger}) // TODO Location os.Stat len
-
-		if err != nil {
-			log.Errorf("Could not tail %s:", err)
-			if len(logFilesToTail) == 0 {
-				log.Debug("Sleeping 10s before retrying")
-				time.Sleep(5 * time.Second)
-				continue
-			} else {
-				continue // take next curFile
-			}
-		}
-		lines = 0
-		log.Errorf("t: %+v", t)
-
-		for line := range t.Lines {
-			if line.Err != nil {
-				log.Error("line.Err", line.Err)
-				time.Sleep(1 * time.Second)
-				break
-			}
-			lines++
-			//log.Error("line", line.Text)
-		}
-		log.Error("lines", lines)
-	}
-}
-
-type Client struct { // Our example struct, you can use "-" to ignore a field
-	log_time               string `csv:"log_time"`
-	user_name              string `csv:"user_name"`
-	database_name          string `csv:"database_name"`
-	process_id             string `csv:"process_id"`
-	connection_from        string `csv:"connection_from"`
-	session_id             string `csv:"session_id"`
-	session_line_num       string `csv:"session_line_num"`
-	command_tag            string `csv:"command_tag"`
-	session_start_time     string `csv:"session_start_time"`
-	virtual_transaction_id string `csv:"virtual_transaction_id"`
-	transaction_id         string `csv:"transaction_id"`
-	error_severity         string `csv:"error_severity"`
-	sql_state_code         string `csv:"sql_state_code"`
-	message                string `csv:"message"`
-	detail                 string `csv:"detail"`
-	hint                   string `csv:"hint"`
-	internal_query         string `csv:"internal_query"`
-	internal_query_pos     string `csv:"internal_query_pos"`
-	context                string `csv:"context"`
-	query                  string `csv:"query"`
-	query_pos              string `csv:"query_pos"`
-	location               string `csv:"location"`
-	application_name       string `csv:"application_name"`
-}
-
 
 func SeverityIsGreaterOrEqualTo(severity, threshold string) bool {
 	thresholdPassed := false
@@ -214,20 +160,38 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 	var eventCounts = make(map[string]int64) // [WARNING: 34, ERROR: 10, ...], re-created on storage send
 	var mdb MonitoredDatabase
 	var hostConfig HostConfigAttrs
+	var config map[string]float64 = config_map
+	var interval float64
 	var err error
 	var firstRun = true
 
 	for {	// re-try loop. re-start in case of FS errors or just to refresh host config
+		select {
+		case msg := <-control_ch:
+			log.Debug("got control msg", dbUniqueName, metricName, msg)
+			if msg.Action == GATHERER_STATUS_START {
+				config = msg.Config
+				interval = config[metricName]
+				log.Debug("started MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
+			} else if msg.Action == GATHERER_STATUS_STOP {
+				log.Debug("exiting MetricGathererLoop for ", dbUniqueName, metricName, " interval:", interval)
+				return
+			}
+		default:
+			if interval == 0 {
+				interval = config[metricName]
+			}
+		}
 
 		if lastConfigRefreshTime.IsZero() ||  lastConfigRefreshTime.Add(time.Second*time.Duration(opts.ServersRefreshLoopSeconds)).Before(time.Now()) {
 			mdb, err = GetMonitoredDatabaseByUniqueName(dbUniqueName)
 			if err != nil {
-				log.Error(err)
+				log.Errorf("[%s] Failed to refresh monitored DBs info: %s", dbUniqueName, err)
 				time.Sleep(60 * time.Second)
 				continue
 			}
-			hostConfig = mdb.HostConfig	// TODO after ServersRefreshLoopSeconds
-			log.Debugf("[%s] hostConfig: %+v", dbUniqueName, hostConfig)
+			hostConfig = mdb.HostConfig
+			log.Debugf("[%s] Refreshed hostConfig: %+v", dbUniqueName, hostConfig)
 		}
 
 		logsMatchRegex = hostConfig.LogsMatchRegex
@@ -343,7 +307,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 
 			if err == io.EOF {
 				//log.Debugf("[%s] EOF reached for logfile %s", dbUniqueName, latest)
-				if eofSleepMillis < 5000 {
+				if eofSleepMillis < 5000 && float64(eofSleepMillis) < interval * 1000 {
 					eofSleepMillis += 1000	// progressively sleep more if nothing going on
 				}
 				time.Sleep(time.Millisecond * time.Duration(eofSleepMillis))
@@ -358,7 +322,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 					if err != nil {
 						log.Warningf("[%s] Failed to close logfile %s properly: %s", dbUniqueName, latest, err)
 					}
-					log.Errorf("[%s] Switching to new logfile: %s", dbUniqueName, file)
+					log.Infof("[%s] Switching to new logfile: %s", dbUniqueName, file)
 					linesRead = 0
 					break
 				} else {
@@ -394,8 +358,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				}
 			}
 
-			metricInterval, _ := config_map[POSTGRESQL_LOG_PARSING_METRIC_NAME] // TODO what if changes?
-			if lastSendTime.IsZero() || lastSendTime.Before(time.Now().Add(-1 * time.Second * time.Duration(metricInterval))) {
+			if lastSendTime.IsZero() || lastSendTime.Before(time.Now().Add(-1 * time.Second * time.Duration(interval))) {
 				log.Debugf("[%s] Sending log event counts for last interval to storage channel. Eventcounts: %+v", dbUniqueName, eventCounts)
 				metricStoreMessages := eventCountsToMetricStoreMessages(eventCounts, logsMinSeverity, mdb)
 				store_ch <- metricStoreMessages

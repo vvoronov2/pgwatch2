@@ -2306,6 +2306,7 @@ func MetricGathererLoop(dbUniqueName, dbType, metricName string, config_map map[
 
 	if metricName == POSTGRESQL_LOG_PARSING_METRIC_NAME {
 		logparseLoop(dbUniqueName, metricName, config_map, control_ch, store_ch)		// no return
+		return
 	}
 
 	for {
