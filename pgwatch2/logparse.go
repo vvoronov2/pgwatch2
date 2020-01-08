@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"io"
+	"path"
 	"regexp"
 	"strings"
 
@@ -20,7 +21,7 @@ var PG_SEVERITIES = [...]string{"DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "
 
 const CSVLOG_DEFAULT_REGEX  = `^^(?P<log_time>.*?),"?(?P<user_name>.*?)"?,"?(?P<database_name>.*?)"?,(?P<process_id>\d+),"?(?P<connection_from>.*?)"?,(?P<session_id>.*?),(?P<session_line_num>\d+),"?(?P<command_tag>.*?)"?,(?P<session_start_time>.*?),(?P<virtual_transaction_id>.*?),(?P<transaction_id>.*?),(?P<error_severity>\w+),`
 const POSTGRESQL_LOG_PARSING_METRIC_NAME = "server_log_event_counts"
-
+const CSVLOG_DEFAULT_GLOB_SUFFIX = "*.csv"
 
 func getFileWithLatestTimestamp(files []string) (string, time.Time) {
 	var maxDate time.Time
@@ -160,7 +161,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 		}
 		logsGlobPath = hostConfig.LogsGlobPath
 		if logsGlobPath == "" {
-			logsGlobPath = tryDetermineLogFolder(dbUniqueName)
+			logsGlobPath = tryDetermineLogFolder(mdb)
 			if logsGlobPath == "" {
 				log.Warningf("[%s] Could not determine Postgres logs parsing folder. Configured logs_glob_path = %s", dbUniqueName, logsGlobPath)
 				time.Sleep(60 * time.Second)
@@ -175,7 +176,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				time.Sleep(60 * time.Second)
 				continue
 			} else {
-				log.Error("changing regex to", logsMatchRegex)
+				log.Infof("[%s] Log parsing enabled. Setting logs parse regex to: %s", dbUniqueName, logsMatchRegex)
 				logsMatchRegexPrev = logsMatchRegex
 			}
 		}
@@ -338,8 +339,22 @@ func ZeroEventCounts(eventCounts map[string]int64) {
 	}
 }
 
-func tryDetermineLogFolder(dbUnique string) string {
-	return ""
+func tryDetermineLogFolder(mdb MonitoredDatabase) string {
+	sql := `select current_setting('data_directory') as dd, current_setting('log_directory') as ld`
+
+	log.Infof("[%s] Trying to determine server logs folder via SQL as host_config.logs_glob_path not specified...", mdb.DBUniqueName)
+	data, err, _ := DBExecReadByDbUniqueName(mdb.DBUniqueName, "", false, sql)
+	if err != nil {
+		log.Errorf("[%s] Failed to query data_directory and log_directory settings...are you superuser or have pg_monitor grant?", mdb.DBUniqueName)
+		return ""
+	}
+	ld := data[0]["ld"].(string)
+	dd := data[0]["dd"].(string)
+	if strings.HasPrefix(ld, "/") {
+		// we have a full path we can use
+		return path.Join(ld, CSVLOG_DEFAULT_GLOB_SUFFIX)
+	}
+	return path.Join(dd, ld, CSVLOG_DEFAULT_GLOB_SUFFIX)
 }
 
 func RegexMatchesToMap(csvlogRegex *regexp.Regexp, matches []string) map[string]string {
