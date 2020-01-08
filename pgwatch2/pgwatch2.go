@@ -197,7 +197,6 @@ const MONITORED_DBS_DATASTORE_SYNC_INTERVAL_SECONDS = 600			// write actively mo
 const MONITORED_DBS_DATASTORE_SYNC_METRIC_NAME = "configured_dbs"	// FYI - for Postgres datastore there's also the admin.all_unique_dbnames table with all recent DB unique names with some metric data
 const RECO_PREFIX = "reco_"		// special handling for metrics with such prefix, data stored in RECO_METRIC_NAME
 const RECO_METRIC_NAME = "recommendations"
-const POSTGRESQL_LOG_PARSING_METRIC_NAME = "postgresql_log_event_counts"
 
 var dbTypeMap = map[string]bool{DBTYPE_PG: true, DBTYPE_PG_CONT: true, DBTYPE_BOUNCER: true, DBTYPE_PATRONI: true, DBTYPE_PATRONI_CONT: true}
 var dbTypes = []string{DBTYPE_PG, DBTYPE_PG_CONT, DBTYPE_BOUNCER, DBTYPE_PATRONI, DBTYPE_PATRONI_CONT} // used for informational purposes

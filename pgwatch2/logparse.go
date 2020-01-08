@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"io"
 	"regexp"
-	"strconv"
 	"strings"
 
 	//	"io"
@@ -20,6 +19,7 @@ var lastParsedLineTimestamp time.Time
 var PG_SEVERITIES = [...]string{"DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "LOG", "FATAL", "PANIC"}
 
 const CSVLOG_DEFAULT_REGEX  = `^^(?P<log_time>.*?),"?(?P<user_name>.*?)"?,"?(?P<database_name>.*?)"?,(?P<process_id>\d+),"?(?P<connection_from>.*?)"?,(?P<session_id>.*?),(?P<session_line_num>\d+),"?(?P<command_tag>.*?)"?,(?P<session_start_time>.*?),(?P<virtual_transaction_id>.*?),(?P<transaction_id>.*?),(?P<error_severity>\w+),`
+const POSTGRESQL_LOG_PARSING_METRIC_NAME = "server_log_event_counts"
 
 
 func getFileWithLatestTimestamp(files []string) (string, time.Time) {
@@ -76,8 +76,7 @@ func getFileWithNextModTimestamp(dbUniqueName, logsGlobPath, currentFile string)
 }
 
 // 1. add zero counts for severity levels that didn't have any occurrences in the log
-// TODO calculate also hourly rate values to simplify dashboarding and alerting queries in Grafana
-func eventCountsToMetricStoreMessages(eventCounts map[string]int64, mdb MonitoredDatabase) []MetricStoreMessage {
+func eventCountsToMetricStoreMessages(eventCounts, eventCountsTotal map[string]int64, mdb MonitoredDatabase) []MetricStoreMessage {
 	allSeverityCounts := make(map[string]interface{})
 
 	for _, s := range PG_SEVERITIES {
@@ -86,6 +85,12 @@ func eventCountsToMetricStoreMessages(eventCounts map[string]int64, mdb Monitore
 			allSeverityCounts[strings.ToLower(s)] = parsedCount
 		} else {
 			allSeverityCounts[strings.ToLower(s)] = 0
+		}
+		parsedCount, ok = eventCountsTotal[s]
+		if ok {
+			allSeverityCounts[strings.ToLower(s) + "_total"] = parsedCount
+		} else {
+			allSeverityCounts[strings.ToLower(s) + "_total"] = 0
 		}
 	}
 	allSeverityCounts["epoch_ns"] = time.Now().UnixNano()
@@ -96,18 +101,17 @@ func eventCountsToMetricStoreMessages(eventCounts map[string]int64, mdb Monitore
 }
 
 
-
-// TODO control_ch
 func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64, control_ch <-chan ControlMessage, store_ch chan<- []MetricStoreMessage) {
 
-	var latest, previous string
+	var latest, previous, realDbname string
 	var latestHandle *os.File
 	var reader *bufio.Reader
 	var linesRead = 0							// to skip over already parsed lines on Postgres server restart for example
     var logsMatchRegex, logsMatchRegexPrev, logsGlobPath string
 	var lastSendTime time.Time               // to storage channel
 	var lastConfigRefreshTime time.Time      // MonitoredDatabase info
-	var eventCounts = make(map[string]int64) // [WARNING: 34, ERROR: 10, ...], re-created on storage send
+	var eventCounts = make(map[string]int64) // for the specific DB. [WARNING: 34, ERROR: 10, ...], zeroed on storage send
+	var eventCountsTotal = make(map[string]int64) // for the whole instance
 	var mdb MonitoredDatabase
 	var hostConfig HostConfigAttrs
 	var config map[string]float64 = config_map
@@ -144,6 +148,10 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 			hostConfig = mdb.HostConfig
 			log.Debugf("[%s] Refreshed hostConfig: %+v", dbUniqueName, hostConfig)
 		}
+
+		db_pg_version_map_lock.RLock()
+		realDbname = db_pg_version_map[dbUniqueName].RealDbname	// to manage 2 sets of event counts - monitored DB + global
+		db_pg_version_map_lock.RUnlock()
 
 		logsMatchRegex = hostConfig.LogsMatchRegex
 		if logsMatchRegex == "" {
@@ -190,7 +198,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				// find latest timestamp
 				latest, _ = getFileWithLatestTimestamp(globMatches)
 				if latest == "" {
-					log.Warningf("[%s] Could not determine the latest logfile. Sleeping 60s...")
+					log.Warningf("[%s] Could not determine the latest logfile. Sleeping 60s...", dbUniqueName)
 					time.Sleep(60 * time.Second)
 					continue
 				}
@@ -273,47 +281,61 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 					linesRead = 0
 					break
 				} else {
-					log.Debugf("[%s] No newer logfiles found. Sleeping %v ms...", dbUniqueName, eofSleepMillis)
+					//log.Debugf("[%s] No newer logfiles found. Sleeping %v ms...", dbUniqueName, eofSleepMillis)
 				}
-				//continue
 			} else {
 				eofSleepMillis = 0
 				linesRead++
 			}
 
 			if err == nil && line != "" {
-				if _, err := strconv.Atoi(line[0:1]); err != nil {	// avoid more expensive regex check if 1st char is not a number, i.e. beginning of a new entry
-					goto send_to_storage_if_needed
-				}
 
 				matches := csvlogRegex.FindStringSubmatch(line)
 				if len(matches) == 0 {
 					log.Debugf("[%s] No logline regex match for line:", dbUniqueName) // normal case actually, for multiline
-					log.Debugf(line)
+					//log.Debugf(line)
 					goto send_to_storage_if_needed
 				}
 
 				result := RegexMatchesToMap(csvlogRegex, matches)
 				log.Debugf("RegexMatchesToMap: %+v", result)
-				severity, ok := result["error_severity"]
+				error_severity, ok := result["error_severity"]
 				if !ok {
-					log.Fatal("error_severity group must be defined in parse regex:", csvlogRegex)
+					log.Error("error_severity group must be defined in parse regex:", csvlogRegex)
+					time.Sleep(time.Minute)
+					break
 				}
-				eventCounts[severity]++
+				database_name, ok := result["database_name"]
+				if !ok {
+					log.Error("database_name group must be defined in parse regex:", csvlogRegex)
+					time.Sleep(time.Minute)
+					break
+				}
+				if realDbname == database_name {
+					eventCounts[error_severity]++
+				}
+				eventCountsTotal[error_severity]++
 			}
+
 		send_to_storage_if_needed:
 			if lastSendTime.IsZero() || lastSendTime.Before(time.Now().Add(-1 * time.Second * time.Duration(interval))) {
-				log.Debugf("[%s] Sending log event counts for last interval to storage channel. Eventcounts: %+v", dbUniqueName, eventCounts)
-				metricStoreMessages := eventCountsToMetricStoreMessages(eventCounts, mdb)
+				log.Debugf("[%s] Sending log event counts for last interval to storage channel. Local eventcounts: %+v, global eventcounts: %+v", dbUniqueName, eventCounts, eventCountsTotal)
+				metricStoreMessages := eventCountsToMetricStoreMessages(eventCounts, eventCountsTotal, mdb)
 				store_ch <- metricStoreMessages
-				eventCounts = make(map[string]int64)
+				ZeroEventCounts(eventCounts)
+				ZeroEventCounts(eventCountsTotal)
 				lastSendTime = time.Now()
 			}
 
 		}	// file read loop
-		//panic("ok 20")
 	}	// config loop
 
+}
+
+func ZeroEventCounts(eventCounts map[string]int64) {
+	for _, severity := range PG_SEVERITIES {
+		eventCounts[severity] = 0
+	}
 }
 
 func tryDetermineLogFolder(dbUnique string) string {
