@@ -24,10 +24,10 @@ NB! If you don't want to add the "test" database (the pgwatch2 configuration db)
 parameter when launching the image.
 
 For production setups without a container management framework also "--restart unless-stopped"
-(or custom startup scripts) is highly recommended. Also usage of volumes is then recommended to enable
-easier updating to newer pgwatch2 Docker images without going through the backup/restore procedure described towards the
-end of README. For maximum flexibility, security and update simplicity though, best would to do a custom setup - see
-paragraph "Installing without Docker" towards the end of README for that.
+(or custom startup scripts) is highly recommended. Also exposing the config/metrics database ports for backups and usage
+of volumes is then recommended to enable easier updating to newer pgwatch2 Docker images without going through the
+backup/restore procedure described towards the end of README. For maximum flexibility, security and update simplicity
+though, best would to do a custom setup - see paragraph "Installing without Docker" towards the end of README for that.
 
 ```
 for v in pg influx grafana pw2 ; do docker volume create $v ; done
@@ -37,10 +37,10 @@ docker run -d --name pw2 -v pg:/var/lib/postgresql -v influx:/var/lib/influxdb -
 docker run -d --name pw2 -v pg:/var/lib/postgresql -v grafana:/var/lib/grafana -v pw2:/pgwatch2/persistent-config -p 8080:8080 -p 3000:3000 -e PW2_TESTDB=true cybertec/pgwatch2-postgres
 ```
 
-For more advanced usecases (production setup backups) or for easier problemsolving you can decide to expose all services
+For more advanced usecases (production setup with backups) or for easier problemsolving you can decide to expose all services
 ```
 # run with all ports exposed
-docker run -d --restart unless-stopped -p 3000:3000 -p 5432:5432 -p 8086:8086 -p 8080:8080 -p 8081:8081 -p 8088:8088 --name pw2 cybertec/pgwatch2
+docker run -d --restart unless-stopped -p 3000:3000 -p 5432:5432 -p 8086:8086 -p 8080:8080 -p 8081:8081 -p 8088:8088 -v ... --name pw2 cybertec/pgwatch2
 ```
 NB! For production usage make sure you also specify listening IPs explicitly (-p IP:host_port:container_port), by default Docker uses 0.0.0.0 (all network devices).
 
@@ -122,10 +122,11 @@ can be used, which only records total runtimes and call counts.
 
 Alerting is very conveniently (point-and-click style) provided by Grafana - see [here](http://docs.grafana.org/alerting/rules/)
 for documentation. All most popular notification services are supported. A hint - currently you can set alerts only on Graph
-panels and there must be no variables used in the query so you cannot use the pre-created pgwatch2 graphs.
+panels and there must be no variables used in the query so you cannot use most of the pre-created pgwatch2 graphs. There's s template
+named "Alert Template" though to give you some ideas on what to alert on.
 
 If more complex scenarios/check conditions are required TICK stack and Kapacitor can be easily integrated - see 
-[here](https://www.influxdata.com/time-series-platform/#kapacitor) for more details. 
+[here](https://www.influxdata.com/time-series-platform/kapacitor/) for more details.
 
 # Components
 
@@ -217,10 +218,12 @@ CREATE ROLE pgwatch2 WITH LOGIN PASSWORD 'secret';
 -- NB! For very important databases it might make sense to ensure that the user
 -- account used for monitoring can only open a limited number of connections (there are according checks in code also though)
 ALTER ROLE pgwatch2 CONNECTION LIMIT 3;
+GRANT pg_monitor TO pgwatch2;   // v10+
 ```
-* Define the helper function to enable the monitoring of sessions counts, types and durations by the `pgwatch2` login defined above.
-If using a superuser login (not recommended) you can skip this step, just ensure that you check the `Is superuser?` checkbox
-(or "is_superuser: true" in YAML mode) when configuring databases.
+* If monitoring below v10 servers and not using superuser and don't also want to grant "pg_monitor" to the monitoring user,
+define the helper function to enable monitoring of some "protected" internal information, like active sessions info. If
+using a superuser login (not recommended for remote "pulling", but only "pushing") you can skip this step.
+
 ```
 psql -h mydb.com -U superuser -f pgwatch2/sql/metric_fetching_helpers/stat_activity_wrapper.sql mydb
 ```
@@ -248,6 +251,10 @@ psql -h mydb.com -U superuser -f pgwatch2/sql/metric_fetching_helpers/cpu_load_p
 
 For more detailed statistics (OS monitoring, table bloat, WAL size, etc) it is recommended to install also all other helpers
 found from the `pgwatch2/sql/metric_fetching_helpers` folder (or `pgwatch2/metrics/00_helpers` for YAML based setup).
+As of v1.6.0 though helpers are not needed for Postgres-native metrics (e.g. WAL size) if a privileged user (superuser or has pg_monitor GRANT)
+is used as all Postres-protected metrics have also "privileged" SQL-s defined for direct access. Another good way to take
+ensure that helpers get installed is to 1st run as superuser, by checking the `Auto-create helpers?` checkbox
+(or "is_superuser: true" in YAML mode) when configuring databases and then switch to the normal unprivileged "pgwatch2" user.
 
 NB! When rolling out helpers make sure the `search_path` is set correctly (same as monitoring role's) as metrics using the
 helpers, assume that monitoring role's `search_path` includes everything needed i.e. they don't qualify any schemas.
@@ -255,9 +262,14 @@ helpers, assume that monitoring role's `search_path` includes everything needed 
 
 ## Warning / notice on using metric fetching helpers
 
-* When installing some "helpers" and laters doing a binary PostgreSQL upgrade via `pg_upgrade`, this could result in some error messages thrown. Then just drop those failing helpers on the "to be upgraded" cluster and re-create them after the upgrade process.
+* When installing some "helpers" and laters doing a binary PostgreSQL upgrade via `pg_upgrade`, this could result in some
+error messages thrown. Then just drop those failing helpers on the "to be upgraded" cluster and re-create them after the upgrade process.
 
-* Starting from Postgres v10 helpers are mostly not needed (only for PL/Python ones getting OS statistics) - there are available some special monitoring roles like "pg_monitor", that are exactly meant to be used for such cases where we want to give access to all Statistics Collector views without any other "superuser behaviour". See [here](https://www.postgresql.org/docs/current/default-roles.html) for documentation on such special system roles.
+* Starting from Postgres v10 helpers are mostly not needed (only for PL/Python ones getting OS statistics) - there are available
+some special monitoring roles like "pg_monitor", that are exactly meant to be used for such cases where we want to give access
+to all Statistics Collector views without any other "superuser behaviour". See [here](https://www.postgresql.org/docs/current/default-roles.html)
+for documentation on such special system roles. Note that currently most out-of-the-box metrics first rely on the helpers
+as v10 is relatively new still, and only when fetching fails, direct access with the "Privileged SQL" is tried.
 
 * For gathering OS statistics (CPU, IO, disk) there are helpers and metrics provided, based on the "psutil" Python package...but from user reports seems the package behaviour differentiates slightly based on the Linux distro / Kernel version used, so small adjustments might be needed there (e.g. remove a non-existen column). Minimum usable Kernel version required is 3.3. Also note that SQL helpers functions are currently defined for Python 2, so for Python 3 you need to change the `LANGUAGE plpythonu` part.
 
@@ -338,7 +350,7 @@ one database is to be monitored) and instead "Host config" JSON field should be 
 ```
 {
 "dcs_type": "etcd",
-"dcs_endpoints": ["127.0.0.1:2379"],
+"dcs_endpoints": ["http://127.0.0.1:2379"],
 "scope": "batman",
 "namespace": "/service/"
 }
@@ -599,3 +611,111 @@ DB that is absolutely needed is the metrics storage DB, here Influx. All example
     Congrats! Now the metrics should start flowing in and after some minutes one should already see some graphs in Grafana.
 
 6. Install and configure SystemD init scripts for the Gatherer and the Web UI [here](https://github.com/cybertec-postgresql/pgwatch2/tree/master/pgwatch2/startup-scripts) and [here](https://github.com/cybertec-postgresql/pgwatch2/tree/master/webpy/startup-scripts) or make sure to hatch up some "init scripts" so that the pgwatch2 daemon and the Web UI would be started automatically when the system reboots. For externally packaged components (Grafana, Influx, Postgres) it should be the case already.
+
+
+# Updating without Docker
+
+For a custom installation there's quite some freedom in doing updates - fully independent components (Grafana, InfluxDB, PostgreSQL)
+can be updated any time without worrying too much about the other components. Only "tightly coupled" components are the
+pgwatch2 metrics collector, config DB and the optional Web UI - if the pgwatch2 config is kept in the database. If YAML
+approach (see the "File based operation" paragraph above) is used then things are more simple - the collector can be updated
+any time as YAML schema has default values for everything and also there's no Web UI (and Config DB = YAML files) and
+there order of component updates doesn't matter.
+
+## Updating Grafana
+
+Check / download the latest version from the official [website](https://grafana.com/grafana/download) or use the Github API:
+```
+VER=$(curl -so- https://api.github.com/repos/grafana/grafana/tags | grep -Eo '"v[0-9\.]+"' | grep -Eo '[0-9\.]+' | sort -nr | head -1)
+wget -q -O grafana.deb https://dl.grafana.com/oss/release/grafana_${VER}_amd64.deb
+dpkg -i grafana.deb
+```
+
+NB! There are no update scripts for the "preset" Grafana dashboards as it would break possible user applied changes. If
+you know that there are no user changes then one can just delete or rename the existing ones and import the latest JSON
+definitions from [here](https://github.com/cybertec-postgresql/pgwatch2/tree/master/grafana_dashboards). Also note that
+the dashboards don't change too frequently so it only makes sense to update if you haven't updated them for half a year
+or more, or if you pick up see some change decriptions from the [CHANGELOG](https://github.com/cybertec-postgresql/pgwatch2/blob/master/CHANGELOG.md).
+
+## Updating the config / metrics DB version
+
+Database updates can be quite complex, with many steps, so it makes sense to follow the manufacturer's instructions here.
+
+For InfluxDB typically something like that is enough though (assuming Debian based distros):
+
+```
+influx -version # check current version
+VER=$(curl -so- https://api.github.com/repos/influxdata/influxdb/tags | grep -Eo '"v[0-9\.]+"' | grep -Eo '[0-9\.]+' | sort -nr | head -1)
+wget -q -O influxdb.deb https://dl.influxdata.com/influxdb/releases/influxdb_${VER}_amd64.deb
+dpkg -i influxdb.deb
+```
+
+For PostgreSQL one should distinguish between minor version updates and major version upgrades. Minor updates are quite
+straightforward and problem-free, consisting of running something like (assuming Debian based distros):
+
+```
+apt update && apt install postgresql
+sudo systemctl restart postgresql
+```
+
+For PostgreSQL major version upgrades one should read the according relase notes (e.g. [here](https://www.postgresql.org/docs/12/release-12.html#id-1.11.6.5.4))
+and be prepared for the unavoidable downtime.
+
+
+## Updating the pgwatch2 schema, metrics collector, metrics, and the optional Web UI
+
+This is the pgwatch2 specific part, with some coupling between the following components - SQL schema, metrics collector,
+and the optional Web UI.
+
+Here one should check from the [CHANGELOG](https://github.com/cybertec-postgresql/pgwatch2/blob/master/CHANGELOG.md) if
+pgwatch2 schema needs updating. If yes, then manual applying of schema diffs is required before running the new gatherer
+or Web UI. If no, i.e. no schema changes, all components can be updated independently in random order.
+
+1. Given that we initially installed pgwatch v1.6.0, and now the latest version is 1.6.2, based on the release notes and
+[SQL diffs](https://github.com/cybertec-postgresql/pgwatch2/tree/master/pgwatch2/sql/config_store/migrations) we need to
+apply the following files:
+
+   ```
+   psql -U pgwatch2 -f pgwatch2/sql/config_store/migrations/v1.6.1-1_patroni_cont_discovery.sql pgwatch2
+   psql -U pgwatch2 -f v1.6.2_superuser_metrics.sql pgwatch2
+   ```
+   NB! When installing from packages the "diffs" are at: /etc/pgwatch2/sql/config_store/migrations/
+
+2. Compile or install the gatherer from RPM / DEB / tarball packages. See the above "Installing without Docker" paragraph
+for building details.
+
+3. Update the optional Python Web UI if using it to administer monitored DB-s and metric configs. The Web UI is not in the
+pre-built packages as deploying self-contained Python that runs on all platforms is not overly easy. If Web UI is started
+directly on the Github sources (`git clone && cd webpy && ./web.py`) then it is actually updated automatically as CherryPy
+web server monitors the file changes. If there were some breaking schema changes though, it might stop working and needs
+a restart after applying schema "diffs".
+
+4. If using SystemD service files to auto-start the collector or the Web UI, you might want to also check for possible
+updates there - "webpy/startup-scripts/pgwatch2-webui.service" for the Web UI or "pgwatch2/startup-scripts/pgwatch2.service" (/etc/pgwatch2/startup-scripts/pgwatch2.service
+for pre-built packages).
+
+5. Checking / updating metric definitions.
+
+   In the YAML mode you always get it automatically when refreshing the sources via Github or pre-built packages, but with
+   Config DB approach one needs to do it manually. Given that there are no user added metrics, is simple enough though - just delete
+   all old ones and re-insert everything from the latest metric definition SQL file.
+
+   ```
+   pg_dump -U pgwatch2 -t pgwatch2.metric pgwatch2 > old_metric.sql  # a just-in-case backup
+   psql -U pgwatch2 -c "truncate pgwatch2.metric" pgwatch2
+   psql -U pgwatch2 -f pgwatch2/sql/config_store/metric_definitions.sql pgwatch2
+   # or when using pre-built packages
+   # psql -U pgwatch2 -f /etc/pgwatch2/sql/config_store/metric_definitions.sql pgwatch2
+   ```
+
+# Kubernetes / Helm
+
+A basic Helm chart is available for installing pgwatch2 to a Kubernetes cluster. The corresponding setup can be found in `./openshift_k8s/helm-chart`, whereas installation is done via the following commands:
+
+```shell script
+cd openshift_k8s
+helm install ./helm-chart --name pgwatch2 -f chart-values.yml
+``` 
+
+Please have a look at `openshift_k8s/helm-chart/values.yaml` to get additional information of configurable options.
+

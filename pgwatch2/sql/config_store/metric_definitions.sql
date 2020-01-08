@@ -259,10 +259,31 @@ $sql$
 
 /* bgwriter */
 
+
 insert into pgwatch2.metric(m_name, m_pg_version_from, m_master_only, m_sql)
 values (
 'bgwriter',
 9.0,
+true,
+$sql$
+select
+   (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+   checkpoints_timed,
+   checkpoints_req,
+   buffers_checkpoint,
+   buffers_clean,
+   maxwritten_clean,
+   buffers_backend,
+   buffers_alloc
+ from
+   pg_stat_bgwriter;
+$sql$
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_master_only, m_sql)
+values (
+'bgwriter',
+9.2,
 true,
 $sql$
 select
@@ -320,19 +341,75 @@ select
   tup_inserted,
   tup_updated,
   tup_deleted,
+  extract(epoch from (now() - pg_postmaster_start_time()))::int8 as postmaster_uptime_s,
+  case when pg_is_in_recovery() then 1 else 0 end as in_recovery_int
+from
+  pg_stat_database
+where
+  datname = current_database();
+$sql$,
+'{"prometheus_gauge_columns": ["numbackends", "postmaster_uptime_s"]}'
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+values (
+'db_stats',
+9.1,
+$sql$
+select
+  (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+  numbackends,
+  xact_commit,
+  xact_rollback,
+  blks_read,
+  blks_hit,
+  tup_returned,
+  tup_fetched,
+  tup_inserted,
+  tup_updated,
+  tup_deleted,
+  conflicts,
+  extract(epoch from (now() - pg_postmaster_start_time()))::int8 as postmaster_uptime_s,
+  case when pg_is_in_recovery() then 1 else 0 end as in_recovery_int
+from
+  pg_stat_database
+where
+  datname = current_database();
+$sql$,
+'{"prometheus_gauge_columns": ["numbackends", "postmaster_uptime_s"]}'
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+values (
+'db_stats',
+9.2,
+$sql$
+select
+  (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+  numbackends,
+  xact_commit,
+  xact_rollback,
+  blks_read,
+  blks_hit,
+  tup_returned,
+  tup_fetched,
+  tup_inserted,
+  tup_updated,
+  tup_deleted,
   conflicts,
   temp_files,
   temp_bytes,
   deadlocks,
   blk_read_time,
   blk_write_time,
-  extract(epoch from (now() - pg_postmaster_start_time()))::int8 as postmaster_uptime_s
+  extract(epoch from (now() - pg_postmaster_start_time()))::int8 as postmaster_uptime_s,
+  case when pg_is_in_recovery() then 1 else 0 end as in_recovery_int
 from
   pg_stat_database
 where
   datname = current_database();
 $sql$,
-'{"prometheus_gauge_columns": ["numbackends", "postmaster_uptime_s", "backup_duration_s"]}'
+'{"prometheus_gauge_columns": ["numbackends", "postmaster_uptime_s"]}'
 );
 
 insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
@@ -359,7 +436,8 @@ select
   blk_read_time,
   blk_write_time,
   extract(epoch from (now() - pg_postmaster_start_time()))::int8 as postmaster_uptime_s,
-  extract(epoch from (now() - pg_backup_start_time()))::int8 as backup_duration_s
+  extract(epoch from (now() - pg_backup_start_time()))::int8 as backup_duration_s,
+  case when pg_is_in_recovery() then 1 else 0 end as in_recovery_int
 from
   pg_stat_database
 where
@@ -394,7 +472,8 @@ select
   extract(epoch from (now() - pg_postmaster_start_time()))::int8 as postmaster_uptime_s,
   extract(epoch from (now() - pg_backup_start_time()))::int8 as backup_duration_s,
   checksum_failures,
-  extract(epoch from (now() - checksum_last_failure))::int8 as checksum_last_failure_s
+  extract(epoch from (now() - checksum_last_failure))::int8 as checksum_last_failure_s,
+  case when pg_is_in_recovery() then 1 else 0 end as in_recovery_int
 from
   pg_stat_database
 where
@@ -943,7 +1022,7 @@ $sql$
 
 /* table_stats */
 
-insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_master_only)
 values (
 'table_stats',
 9.0,
@@ -978,12 +1057,53 @@ from
 where
   -- leaving out fully locked tables as pg_relation_size also wants a lock and would wait
   not exists (select 1 from pg_locks where relation = relid and mode = 'AccessExclusiveLock' and granted)
-  and c.relpersistence != 't'  order by toast_size_b desc nulls last; -- and temp tables
+  and not relistemp; -- and temp tables
 $sql$,
-'{"prometheus_gauge_columns": ["table_size_b", "total_relation_size_b", "toast_size_b", "seconds_since_last_vacuum", "seconds_since_last_analyze", "n_live_tup", "n_dead_tup"]}'
+'{"prometheus_gauge_columns": ["table_size_b", "total_relation_size_b", "toast_size_b", "seconds_since_last_vacuum", "seconds_since_last_analyze", "n_live_tup", "n_dead_tup"]}',
+true
 );
 
-insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_standby_only)
+values (
+'table_stats',
+9.0,
+$sql$
+select
+  (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+  quote_ident(schemaname) as tag_schema,
+  quote_ident(ut.relname) as tag_table_name,
+  quote_ident(schemaname)||'.'||quote_ident(ut.relname) as tag_table_full_name,
+  pg_table_size(relid) as table_size_b,
+  abs(greatest(ceil(log((pg_table_size(relid)+1) / 10^6)), 0))::text as tag_table_size_cardinality_mb, -- i.e. 0=<1MB, 1=<10MB, 2=<100MB,..
+  pg_total_relation_size(relid) as total_relation_size_b,
+  case when reltoastrelid != 0 then pg_total_relation_size(reltoastrelid) else 0::int8 end as toast_size_b,
+  (extract(epoch from now() - greatest(last_vacuum, last_autovacuum)))::int8 as seconds_since_last_vacuum,
+  (extract(epoch from now() - greatest(last_analyze, last_autoanalyze)))::int8 as seconds_since_last_analyze,
+  case when 'autovacuum_enabled=off' = ANY(c.reloptions) then 1 else 0 end as no_autovacuum,
+  seq_scan,
+  seq_tup_read,
+  idx_scan,
+  idx_tup_fetch,
+  n_tup_ins,
+  n_tup_upd,
+  n_tup_del,
+  n_tup_hot_upd,
+  n_live_tup,
+  n_dead_tup
+from
+  pg_stat_user_tables ut
+  join
+  pg_class c on c.oid = ut.relid
+where
+  -- leaving out fully locked tables as pg_relation_size also wants a lock and would wait
+  not exists (select 1 from pg_locks where relation = relid and mode = 'AccessExclusiveLock' and granted)
+  and not relistemp; -- and temp tables
+$sql$,
+'{"prometheus_gauge_columns": ["table_size_b", "total_relation_size_b", "toast_size_b", "seconds_since_last_vacuum", "seconds_since_last_analyze", "n_live_tup", "n_dead_tup"]}',
+true
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_master_only)
 values (
 'table_stats',
 9.1,
@@ -996,7 +1116,7 @@ select
   pg_table_size(relid) as table_size_b,
   abs(greatest(ceil(log((pg_table_size(relid)+1) / 10^6)), 0))::text as tag_table_size_cardinality_mb, -- i.e. 0=<1MB, 1=<10MB, 2=<100MB,..
   pg_total_relation_size(relid) as total_relation_size_b,
-  pg_total_relation_size((select reltoastrelid from pg_class where oid = ut.relid)) as toast_size_b,
+  case when reltoastrelid != 0 then pg_total_relation_size(reltoastrelid) else 0::int8 end as toast_size_b,
   (extract(epoch from now() - greatest(last_vacuum, last_autovacuum)))::int8 as seconds_since_last_vacuum,
   (extract(epoch from now() - greatest(last_analyze, last_autoanalyze)))::int8 as seconds_since_last_analyze,
   case when 'autovacuum_enabled=off' = ANY(c.reloptions) then 1 else 0 end as no_autovacuum,
@@ -1022,7 +1142,98 @@ from
 where
   -- leaving out fully locked tables as pg_relation_size also wants a lock and would wait
   not exists (select 1 from pg_locks where relation = relid and mode = 'AccessExclusiveLock' and granted)
-  and c.relpersistence != 't'  order by toast_size_b desc nulls last; -- and temp tables
+  and c.relpersistence != 't'; -- and temp tables
+$sql$,
+'{"prometheus_gauge_columns": ["table_size_b", "total_relation_size_b", "toast_size_b", "seconds_since_last_vacuum", "seconds_since_last_analyze", "n_live_tup", "n_dead_tup"]}',
+true
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_standby_only)
+values (
+'table_stats',
+9.1,
+$sql$
+select
+  (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+  quote_ident(schemaname) as tag_schema,
+  quote_ident(ut.relname) as tag_table_name,
+  quote_ident(schemaname)||'.'||quote_ident(ut.relname) as tag_table_full_name,
+  pg_table_size(relid) as table_size_b,
+  abs(greatest(ceil(log((pg_table_size(relid)+1) / 10^6)), 0))::text as tag_table_size_cardinality_mb, -- i.e. 0=<1MB, 1=<10MB, 2=<100MB,..
+  pg_total_relation_size(relid) as total_relation_size_b,
+  case when reltoastrelid != 0 then pg_total_relation_size(reltoastrelid) else 0::int8 end as toast_size_b,
+  (extract(epoch from now() - greatest(last_vacuum, last_autovacuum)))::int8 as seconds_since_last_vacuum,
+  (extract(epoch from now() - greatest(last_analyze, last_autoanalyze)))::int8 as seconds_since_last_analyze,
+  case when 'autovacuum_enabled=off' = ANY(c.reloptions) then 1 else 0 end as no_autovacuum,
+  seq_scan,
+  seq_tup_read,
+  idx_scan,
+  idx_tup_fetch,
+  n_tup_ins,
+  n_tup_upd,
+  n_tup_del,
+  n_tup_hot_upd,
+  n_live_tup,
+  n_dead_tup,
+  vacuum_count,
+  autovacuum_count,
+  analyze_count,
+  autoanalyze_count,
+  age(relfrozenxid) as tx_freeze_age
+from
+  pg_stat_user_tables ut
+  join
+  pg_class c on c.oid = ut.relid
+where
+  -- leaving out fully locked tables as pg_relation_size also wants a lock and would wait
+  not exists (select 1 from pg_locks where relation = relid and mode = 'AccessExclusiveLock' and granted)
+  and c.relpersistence != 't'; -- and temp tables
+$sql$,
+'{"prometheus_gauge_columns": ["table_size_b", "total_relation_size_b", "toast_size_b", "seconds_since_last_vacuum", "seconds_since_last_analyze", "n_live_tup", "n_dead_tup"]}',
+true
+);
+
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+values (
+'table_stats',
+9.2,
+$sql$
+select
+  (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+  quote_ident(schemaname) as tag_schema,
+  quote_ident(ut.relname) as tag_table_name,
+  quote_ident(schemaname)||'.'||quote_ident(ut.relname) as tag_table_full_name,
+  pg_table_size(relid) as table_size_b,
+  abs(greatest(ceil(log((pg_table_size(relid)+1) / 10^6)), 0))::text as tag_table_size_cardinality_mb, -- i.e. 0=<1MB, 1=<10MB, 2=<100MB,..
+  pg_total_relation_size(relid) as total_relation_size_b,
+  case when reltoastrelid != 0 then pg_total_relation_size(reltoastrelid) else 0::int8 end as toast_size_b,
+  (extract(epoch from now() - greatest(last_vacuum, last_autovacuum)))::int8 as seconds_since_last_vacuum,
+  (extract(epoch from now() - greatest(last_analyze, last_autoanalyze)))::int8 as seconds_since_last_analyze,
+  case when 'autovacuum_enabled=off' = ANY(c.reloptions) then 1 else 0 end as no_autovacuum,
+  seq_scan,
+  seq_tup_read,
+  idx_scan,
+  idx_tup_fetch,
+  n_tup_ins,
+  n_tup_upd,
+  n_tup_del,
+  n_tup_hot_upd,
+  n_live_tup,
+  n_dead_tup,
+  vacuum_count,
+  autovacuum_count,
+  analyze_count,
+  autoanalyze_count,
+  age(relfrozenxid) as tx_freeze_age
+from
+  pg_stat_user_tables ut
+  join
+  pg_class c on c.oid = ut.relid
+where
+  -- leaving out fully locked tables as pg_relation_size also wants a lock and would wait
+  not exists (select 1 from pg_locks where relation = relid and mode = 'AccessExclusiveLock' and granted)
+  and c.relpersistence != 't'; -- and temp tables
 $sql$,
 '{"prometheus_gauge_columns": ["table_size_b", "total_relation_size_b", "toast_size_b", "seconds_since_last_vacuum", "seconds_since_last_analyze", "n_live_tup", "n_dead_tup"]}'
 );
@@ -1082,8 +1293,211 @@ $sql$
 with q_data as (
   select
     (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    (regexp_replace(md5(query), E'\\D', '', 'g'))::varchar(10)::int8 as tag_queryid,
+    max(ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g')))::varchar(16000) as tag_query,
+    array_to_string(array_agg(distinct quote_ident(pg_get_userbyid(userid))), ',') as users,
+    sum(s.calls)::int8 as calls,
+    sum(s.total_time)::double precision as total_time,
+    sum(shared_blks_hit)::int8 as shared_blks_hit,
+    sum(shared_blks_read)::int8 as shared_blks_read,
+    sum(shared_blks_written)::int8 as shared_blks_written,
+    sum(shared_blks_dirtied)::int8 as shared_blks_dirtied,
+    sum(temp_blks_read)::int8 as temp_blks_read,
+    sum(temp_blks_written)::int8 as temp_blks_written,
+    sum(blk_read_time)::double precision as blk_read_time,
+    sum(blk_write_time)::double precision as blk_write_time
+  from
+    get_stat_statements() s
+  where
+    calls > 5
+    and total_time > 0
+    and dbid = (select oid from pg_database where datname = current_database())
+    and not upper(s.query) like any (array['DEALLOCATE%', 'SET %', 'RESET %', 'BEGIN%', 'BEGIN;',
+      'COMMIT%', 'END%', 'ROLLBACK%', 'SHOW%'])
+  group by
+    tag_queryid
+)
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    total_time > 0
+  order by
+    total_time desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  order by
+    calls desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    shared_blks_read > 0
+  order by
+    shared_blks_read desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    shared_blks_written > 0
+  order by
+    shared_blks_written desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    temp_blks_read > 0
+  order by
+    temp_blks_read desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    temp_blks_written > 0
+  order by
+    temp_blks_written desc
+  limit 100
+) a;
+$sql$,
+$sql$
+with q_data as (
+  select
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    (regexp_replace(md5(query), E'\\D', '', 'g'))::varchar(10)::int8 as tag_queryid,
+    max(ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g')))::varchar(16000) as tag_query,
+    array_to_string(array_agg(distinct quote_ident(pg_get_userbyid(userid))), ',') as users,
+    sum(s.calls)::int8 as calls,
+    sum(s.total_time)::double precision as total_time,
+    sum(shared_blks_hit)::int8 as shared_blks_hit,
+    sum(shared_blks_read)::int8 as shared_blks_read,
+    sum(shared_blks_written)::int8 as shared_blks_written,
+    sum(shared_blks_dirtied)::int8 as shared_blks_dirtied,
+    sum(temp_blks_read)::int8 as temp_blks_read,
+    sum(temp_blks_written)::int8 as temp_blks_written,
+    sum(blk_read_time)::double precision as blk_read_time,
+    sum(blk_write_time)::double precision as blk_write_time
+  from
+    get_stat_statements() s
+  where
+    calls > 5
+    and total_time > 0
+    and dbid = (select oid from pg_database where datname = current_database())
+    and not upper(s.query) like any (array['DEALLOCATE%', 'SET %', 'RESET %', 'BEGIN%', 'BEGIN;',
+      'COMMIT%', 'END%', 'ROLLBACK%', 'SHOW%'])
+  group by
+    tag_queryid
+)
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    total_time > 0
+  order by
+    total_time desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  order by
+    calls desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    shared_blks_read > 0
+  order by
+    shared_blks_read desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    shared_blks_written > 0
+  order by
+    shared_blks_written desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    temp_blks_read > 0
+  order by
+    temp_blks_read desc
+  limit 100
+) a
+union
+select * from (
+  select
+    *
+  from
+    q_data
+  where
+    temp_blks_written > 0
+  order by
+    temp_blks_written desc
+  limit 100
+) a;
+$sql$
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_sql_su)
+values (
+'stat_statements',
+9.4,
+$sql$
+with q_data as (
+  select
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
     queryid::text as tag_queryid,
     max(ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g')))::varchar(16000) as tag_query,
+    array_to_string(array_agg(distinct quote_ident(pg_get_userbyid(userid))), ',') as users,
     sum(s.calls)::int8 as calls,
     sum(s.total_time)::double precision as total_time,
     sum(shared_blks_hit)::int8 as shared_blks_hit,
@@ -1181,6 +1595,7 @@ with q_data as (
     (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
     queryid::text as tag_queryid,
     max(ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g')))::varchar(16000) as tag_query,
+    array_to_string(array_agg(distinct quote_ident(pg_get_userbyid(userid))), ',') as users,
     sum(s.calls)::int8 as calls,
     sum(s.total_time)::double precision as total_time,
     sum(shared_blks_hit)::int8 as shared_blks_hit,
@@ -2250,10 +2665,75 @@ $sql$
 );
 
 /* table (and view) hashes for change detection  */
-insert into pgwatch2.metric(m_name, m_pg_version_from,m_sql)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql)
 values (
 'table_hashes',
 9.0,
+$sql$
+select
+  (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+  quote_ident(table_schema)||'.'||quote_ident(table_name) as tag_table,
+  md5((array_agg((c.*)::text order by ordinal_position))::text)
+from (
+         SELECT current_database()::information_schema.sql_identifier AS table_catalog, nc.nspname::information_schema.sql_identifier AS table_schema, c.relname::information_schema.sql_identifier AS table_name, a.attname::information_schema.sql_identifier AS column_name, a.attnum::information_schema.cardinal_number AS ordinal_position, pg_get_expr(ad.adbin, ad.adrelid)::information_schema.character_data AS column_default,
+                CASE
+                    WHEN a.attnotnull OR t.typtype = 'd'::"char" AND t.typnotnull THEN 'NO'::text
+                    ELSE 'YES'::text
+                    END::information_schema.yes_or_no AS is_nullable,
+                CASE
+                    WHEN t.typtype = 'd'::"char" THEN
+                        CASE
+                            WHEN bt.typelem <> 0::oid AND bt.typlen = (-1) THEN 'ARRAY'::text
+                            WHEN nbt.nspname = 'pg_catalog'::name THEN format_type(t.typbasetype, NULL::integer)
+                            ELSE 'USER-DEFINED'::text
+                            END
+                    ELSE
+                        CASE
+                            WHEN t.typelem <> 0::oid AND t.typlen = (-1) THEN 'ARRAY'::text
+                            WHEN nt.nspname = 'pg_catalog'::name THEN format_type(a.atttypid, NULL::integer)
+                            ELSE 'USER-DEFINED'::text
+                            END
+                    END::information_schema.character_data AS data_type, information_schema._pg_char_max_length(information_schema._pg_truetypid(a.*, t.*), information_schema._pg_truetypmod(a.*, t.*))::information_schema.cardinal_number AS character_maximum_length, information_schema._pg_char_octet_length(information_schema._pg_truetypid(a.*, t.*), information_schema._pg_truetypmod(a.*, t.*))::information_schema.cardinal_number AS character_octet_length, information_schema._pg_numeric_precision(information_schema._pg_truetypid(a.*, t.*), information_schema._pg_truetypmod(a.*, t.*))::information_schema.cardinal_number AS numeric_precision, information_schema._pg_numeric_precision_radix(information_schema._pg_truetypid(a.*, t.*), information_schema._pg_truetypmod(a.*, t.*))::information_schema.cardinal_number AS numeric_precision_radix, information_schema._pg_numeric_scale(information_schema._pg_truetypid(a.*, t.*), information_schema._pg_truetypmod(a.*, t.*))::information_schema.cardinal_number AS numeric_scale, information_schema._pg_datetime_precision(information_schema._pg_truetypid(a.*, t.*), information_schema._pg_truetypmod(a.*, t.*))::information_schema.cardinal_number AS datetime_precision, NULL::character varying::information_schema.character_data AS interval_type, NULL::character varying::information_schema.character_data AS interval_precision, NULL::character varying::information_schema.sql_identifier AS character_set_catalog, NULL::character varying::information_schema.sql_identifier AS character_set_schema, NULL::character varying::information_schema.sql_identifier AS character_set_name, NULL::character varying::information_schema.sql_identifier AS collation_catalog, NULL::character varying::information_schema.sql_identifier AS collation_schema, NULL::character varying::information_schema.sql_identifier AS collation_name,
+                CASE
+                    WHEN t.typtype = 'd'::"char" THEN current_database()
+                    ELSE NULL::name
+                    END::information_schema.sql_identifier AS domain_catalog,
+                CASE
+                    WHEN t.typtype = 'd'::"char" THEN nt.nspname
+                    ELSE NULL::name
+                    END::information_schema.sql_identifier AS domain_schema,
+                CASE
+                    WHEN t.typtype = 'd'::"char" THEN t.typname
+                    ELSE NULL::name
+                    END::information_schema.sql_identifier AS domain_name, current_database()::information_schema.sql_identifier AS udt_catalog, COALESCE(nbt.nspname, nt.nspname)::information_schema.sql_identifier AS udt_schema, COALESCE(bt.typname, t.typname)::information_schema.sql_identifier AS udt_name, NULL::character varying::information_schema.sql_identifier AS scope_catalog, NULL::character varying::information_schema.sql_identifier AS scope_schema, NULL::character varying::information_schema.sql_identifier AS scope_name, NULL::integer::information_schema.cardinal_number AS maximum_cardinality, a.attnum::information_schema.sql_identifier AS dtd_identifier, 'NO'::character varying::information_schema.yes_or_no AS is_self_referencing, 'NO'::character varying::information_schema.yes_or_no AS is_identity, NULL::character varying::information_schema.character_data AS identity_generation, NULL::character varying::information_schema.character_data AS identity_start, NULL::character varying::information_schema.character_data AS identity_increment, NULL::character varying::information_schema.character_data AS identity_maximum, NULL::character varying::information_schema.character_data AS identity_minimum, NULL::character varying::information_schema.yes_or_no AS identity_cycle, 'NEVER'::character varying::information_schema.character_data AS is_generated, NULL::character varying::information_schema.character_data AS generation_expression,
+                CASE
+                    WHEN c.relkind = 'r'::"char" OR c.relkind = 'v'::"char" AND (EXISTS ( SELECT 1
+                                                                                          FROM pg_rewrite
+                                                                                          WHERE pg_rewrite.ev_class = c.oid AND pg_rewrite.ev_type = '2'::"char" AND pg_rewrite.is_instead)) AND (EXISTS ( SELECT 1
+                                                                                                                                                                                                           FROM pg_rewrite
+                                                                                                                                                                                                           WHERE pg_rewrite.ev_class = c.oid AND pg_rewrite.ev_type = '4'::"char" AND pg_rewrite.is_instead)) THEN 'YES'::text
+                    ELSE 'NO'::text
+                    END::information_schema.yes_or_no AS is_updatable
+         FROM pg_attribute a
+                  LEFT JOIN pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum, pg_class c, pg_namespace nc, pg_type t
+                                                                                                                               JOIN pg_namespace nt ON t.typnamespace = nt.oid
+                                                                                                                               LEFT JOIN (pg_type bt
+             JOIN pg_namespace nbt ON bt.typnamespace = nbt.oid) ON t.typtype = 'd'::"char" AND t.typbasetype = bt.oid
+         WHERE a.attrelid = c.oid AND a.atttypid = t.oid AND nc.oid = c.relnamespace AND NOT pg_is_other_temp_schema(nc.oid) AND a.attnum > 0 AND NOT a.attisdropped AND (c.relkind = ANY (ARRAY['r'::"char", 'v'::"char"])) AND (pg_has_role(c.relowner, 'USAGE'::text) OR has_column_privilege(c.oid, a.attnum, 'SELECT, INSERT, UPDATE, REFERENCES'::text))
+) c
+where
+  not table_schema like any (array[E'pg\\_%', 'information_schema'])
+group by
+  table_schema, table_name
+order by
+  table_schema, table_name;
+$sql$
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql)
+values (
+'table_hashes',
+9.3,
 $sql$
 select
   (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
@@ -2554,7 +3034,7 @@ $sql$,
 insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
 values (
 'psutil_cpu',
-9.0,
+9.1,
 $sql$
 
 SELECT
@@ -2567,10 +3047,63 @@ $sql$,
 '{"prometheus_all_gauge_columns": true}'
 );
 
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_is_helper)
+values (
+'get_psutil_cpu',
+9.1,
+$sql$
+/*  Pre-requisites: PL/Pythonu and "psutil" Python package (e.g. pip install psutil)
+    NB! "psutil" is known to behave differently depending on the used version and operating system, so if getting
+    errors please adjust to your needs. "psutil" documentation here: https://psutil.readthedocs.io/en/latest/
+*/
+CREATE EXTENSION IF NOT EXISTS plpythonu; /* NB! "plpythonu" might need changing to "plpython3u" everywhere for new OS-es */
+
+CREATE OR REPLACE FUNCTION get_psutil_cpu(
+	OUT cpu_utilization float8, OUT load_1m_norm float8, OUT load_1m float8, OUT load_5m_norm float8, OUT load_5m float8,
+    OUT "user" float8, OUT system float8, OUT idle float8, OUT iowait float8, OUT irqs float8, OUT other float8
+)
+ LANGUAGE plpythonu
+ SECURITY DEFINER
+AS $FUNCTION$
+
+from os import getloadavg
+from psutil import cpu_times_percent, cpu_percent, cpu_count
+from threading import Thread
+
+class GetCpuPercentThread(Thread):
+    def __init__(self, interval_seconds):
+        self.interval_seconds = interval_seconds
+        self.cpu_utilization_info = None
+        super(GetCpuPercentThread, self).__init__()
+
+    def run(self):
+        self.cpu_utilization_info = cpu_percent(self.interval_seconds)
+
+t = GetCpuPercentThread(0.5)
+t.start()
+
+ct = cpu_times_percent(0.5)
+la = getloadavg()
+
+t.join()
+
+return t.cpu_utilization_info, la[0] / cpu_count(), la[0], la[1] / cpu_count(), la[1], ct.user, ct.system, ct.idle, ct.iowait, ct.irq + ct.softirq, ct.steal + ct.guest + ct.guest_nice
+
+$FUNCTION$;
+
+GRANT EXECUTE ON FUNCTION get_psutil_cpu() TO pgwatch2;
+COMMENT ON FUNCTION get_psutil_cpu() IS 'created for pgwatch2';
+
+
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
+);
+
 insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
 values (
 'psutil_mem',
-9.0,
+9.1,
 $sql$
 SELECT
   (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
@@ -2582,10 +3115,39 @@ $sql$,
 '{"prometheus_all_gauge_columns": true}'
 );
 
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_is_helper)
+values (
+'get_psutil_mem',
+9.1,
+$sql$
+/* Pre-requisites: PL/Pythonu and "psutil" Python package (e.g. pip install psutil) */
+CREATE EXTENSION IF NOT EXISTS plpythonu; -- NB! "plpythonu" might need changing to "plpython3u" everywhere for new OS-es
+
+CREATE OR REPLACE FUNCTION get_psutil_mem(
+	OUT total float8, OUT used float8, OUT free float8, OUT buff_cache float8, OUT available float8, OUT percent float8,
+	OUT swap_total float8, OUT swap_used float8, OUT swap_free float8, OUT swap_percent float8
+)
+ LANGUAGE plpythonu
+ SECURITY DEFINER
+AS $FUNCTION$
+from psutil import virtual_memory, swap_memory
+vm = virtual_memory()
+sw = swap_memory()
+return vm.total, vm.used, vm.free, vm.buffers + vm.cached, vm.available, vm.percent, sw.total, sw.used, sw.free, sw.percent
+$FUNCTION$;
+
+GRANT EXECUTE ON FUNCTION get_psutil_mem() TO pgwatch2;
+COMMENT ON FUNCTION get_psutil_mem() IS 'created for pgwatch2';
+
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
+);
+
 insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
 values (
 'psutil_disk',
-9.0,
+9.1,
 $sql$
 SELECT
   (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
@@ -2598,10 +3160,82 @@ $sql$,
 '{"prometheus_all_gauge_columns": true}'
 );
 
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_is_helper)
+values (
+'get_psutil_disk',
+9.1,
+$sql$
+/* Pre-requisites: PL/Pythonu and "psutil" Python package (e.g. pip install psutil) */
+CREATE EXTENSION IF NOT EXISTS plpythonu; /* NB! "plpythonu" might need changing to "plpython3u" everywhere for new OS-es */
+
+CREATE OR REPLACE FUNCTION get_psutil_disk(
+	OUT dir_or_tablespace text, OUT path text, OUT total float8, OUT used float8, OUT free float8, OUT percent float8
+)
+ RETURNS SETOF record
+ LANGUAGE plpythonu
+ SECURITY DEFINER
+AS $FUNCTION$
+
+from os import stat
+from os.path import join, exists
+from psutil import disk_usage
+ret_list = []
+
+# data_directory
+r = plpy.execute("select current_setting('data_directory') as dd, current_setting('log_directory') as ld, current_setting('server_version_num')::int as pgver")
+dd = r[0]['dd']
+ld = r[0]['ld']
+du_dd = disk_usage(dd)
+ret_list.append(['data_directory', dd, du_dd.total, du_dd.used, du_dd.free, du_dd.percent])
+
+dd_stat = stat(dd)
+# log_directory
+if ld:
+    if not ld.startswith('/'):
+        ld_path = join(dd, ld)
+    else:
+        ld_path = ld
+    if exists(ld_path):
+        log_stat = stat(ld_path)
+        if log_stat.st_dev == dd_stat.st_dev:
+            pass                                # no new info, same device
+        else:
+            du = disk_usage(ld_path)
+            ret_list.append(['log_directory', ld_path, du.total, du.used, du.free, du.percent])
+
+# WAL / XLOG directory
+# plpy.notice('pg_wal' if r[0]['pgver'] >= 100000 else 'pg_xlog', r[0]['pgver'])
+joined_path_wal = join(r[0]['dd'], 'pg_wal' if r[0]['pgver'] >= 100000 else 'pg_xlog')
+wal_stat = stat(joined_path_wal)
+if wal_stat.st_dev == dd_stat.st_dev:
+    pass                                # no new info, same device
+else:
+    du = disk_usage(joined_path_wal)
+    ret_list.append(['pg_wal', joined_path_wal, du.total, du.used, du.free, du.percent])
+
+# add user created tablespaces if any
+sql_tablespaces = """
+    select spcname as name, pg_catalog.pg_tablespace_location(oid) as location
+    from pg_catalog.pg_tablespace where not spcname like any(array[E'pg\\_%'])"""
+for row in plpy.cursor(sql_tablespaces):
+    du = disk_usage(row['location'])
+    ret_list.append([row['name'], row['location'], du.total, du.used, du.free, du.percent])
+return ret_list
+
+$FUNCTION$;
+
+GRANT EXECUTE ON FUNCTION get_psutil_disk() TO pgwatch2;
+COMMENT ON FUNCTION get_psutil_disk() IS 'created for pgwatch2';
+
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
+);
+
 insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
 values (
 'psutil_disk_io_total',
-9.0,
+9.1,
 $sql$
 SELECT
   (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
@@ -2613,6 +3247,34 @@ from
   get_psutil_disk_io_total();
 $sql$,
 '{"prometheus_all_gauge_columns": true}'
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_is_helper)
+values (
+'get_psutil_disk_io_total',
+9.1,
+$sql$
+
+/* Pre-requisites: PL/Pythonu and "psutil" Python package (e.g. pip install psutil) */
+CREATE EXTENSION IF NOT EXISTS plpythonu; /* NB! "plpythonu" might need changing to "plpython3u" everywhere for new OS-es */
+
+CREATE OR REPLACE FUNCTION get_psutil_disk_io_total(
+	OUT read_count float8, OUT write_count float8, OUT read_bytes float8, OUT write_bytes float8
+)
+ LANGUAGE plpythonu
+ SECURITY DEFINER
+AS $FUNCTION$
+from psutil import disk_io_counters
+dc = disk_io_counters(perdisk=False)
+return dc.read_count, dc.write_count, dc.read_bytes, dc.write_bytes
+$FUNCTION$;
+
+GRANT EXECUTE ON FUNCTION get_psutil_disk_io_total() TO pgwatch2;
+COMMENT ON FUNCTION get_psutil_disk_io_total() IS 'created for pgwatch2';
+
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
 );
 
 insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
@@ -2697,7 +3359,7 @@ $sql$,
 insert into pgwatch2.metric(m_name, m_pg_version_from, m_standby_only, m_sql, m_column_attrs)
 values (
 'wal_receiver',
-9.6,
+10,
 true,
 $sql$
 select
@@ -2792,3 +3454,376 @@ $sql$,
 '{"prometheus_all_gauge_columns": true}'
 );
 
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+values (
+'stat_activity_realtime',
+9.0,
+$sql$
+SELECT
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    pid as tag_pid,
+    usename::text AS user,
+    application_name AS appname,
+    coalesce(client_addr::text, 'local') AS ip,
+    extract(epoch FROM (now() - query_start))::int AS duration_s,
+    waiting::int,
+    case when sa.waiting then
+             (select array_to_string((select array_agg(distinct b.pid order by b.pid) from pg_locks b join pg_locks l on l.database = b.database and l.relation = b.relation
+                                      where l.pid = sa.procpid and b.pid != l.pid and b.granted and not l.granted), ','))
+         else
+             null
+        end as blocking_pids,
+    ltrim(regexp_replace(current_query, E'[ \\t\\n\\r]+' , ' ', 'g'))::varchar(300) AS query
+FROM
+    pg_stat_activity sa
+WHERE
+    current_query <> '<IDLE>'
+    AND procpid != pg_backend_pid()
+    AND datname = current_database()
+    AND NOW() - query_start > '500ms'::interval
+ORDER BY
+    NOW() - query_start DESC
+LIMIT 25;
+$sql$,
+'{"prometheus_all_gauge_columns": true}'
+);
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+values (
+'stat_activity_realtime',
+9.2,
+$sql$
+SELECT
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    pid as tag_pid,
+    usename::text AS user,
+    application_name AS appname,
+    coalesce(client_addr::text, 'local') AS ip,
+    extract(epoch FROM (now() - query_start))::int AS duration_s,
+    waiting::int,
+    case when sa.waiting then
+        (select array_to_string((select array_agg(distinct b.pid order by b.pid) from pg_locks b join pg_locks l on l.database = b.database and l.relation = b.relation
+           where l.pid = sa.pid and b.pid != l.pid and b.granted and not l.granted), ','))
+        else
+            null
+    end as blocking_pids,
+    ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g'))::varchar(300) AS query
+FROM
+    pg_stat_activity sa
+WHERE
+    state != 'idle'
+    AND pid != pg_backend_pid()
+    AND datname = current_database()
+    AND now() - query_start > '500ms'::interval
+ORDER BY
+    now() - query_start DESC
+LIMIT 25;
+$sql$,
+'{"prometheus_all_gauge_columns": true}'
+);
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+values (
+'stat_activity_realtime',
+9.6,
+$sql$
+SELECT
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    pid as tag_pid,
+    usename::text AS user,
+    application_name AS appname,
+    coalesce(client_addr::text, 'local') AS ip,
+    extract(epoch FROM (now() - query_start))::int AS duration_s,
+    (wait_event_type IS NOT NULL)::int AS waiting,
+    array_to_string(pg_blocking_pids(pid), ',') as blocking_pids,
+    ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g'))::varchar(300) AS query
+FROM
+    pg_stat_activity
+WHERE
+  state != 'idle'
+  AND pid != pg_backend_pid()
+  AND datname = current_database()
+  AND now() - query_start > '500ms'::interval
+ORDER BY
+  now() - query_start DESC
+LIMIT 25;
+$sql$,
+'{"prometheus_all_gauge_columns": true}'
+);
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+values (
+'stat_activity_realtime',
+10,
+$sql$
+SELECT
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    pid as tag_pid,
+    usename::text AS user,
+    application_name AS appname,
+    coalesce(client_addr::text, 'local') AS ip,
+    extract(epoch FROM (now() - query_start))::int AS duration_s,
+    (coalesce(wait_event_type, '') IN ('LWLockNamed', 'Lock', 'BufferPin'))::int AS waiting,
+    array_to_string(pg_blocking_pids(pid), ',') as blocking_pids,
+    ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g'))::varchar(300) AS query
+FROM
+    pg_stat_activity
+WHERE
+  state != 'idle'
+  AND backend_type IN ('client backend', 'autovacuum worker')
+  AND pid != pg_backend_pid()
+  AND datname = current_database()
+  AND now() - query_start > '500ms'::interval
+ORDER BY
+  now() - query_start DESC
+LIMIT 25;
+$sql$,
+'{"prometheus_all_gauge_columns": true}'
+);
+
+/* RECO */
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_master_only)
+values (
+'reco_add_index',
+9.0,
+$sql$
+/* assumes the pg_qualstats extension and superuser or select grants on pg_qualstats_indexes_ddl view */
+select
+  'create_index' as tag_reco_topic,
+  quote_ident(nspname::text)||'.'||quote_ident(relid::text) as tag_object_name,
+  ddl as recommendation,
+  'qual execution count: '|| execution_count as extra_info
+from
+  pg_qualstats_indexes_ddl
+order by
+  execution_count desc
+limit 25;
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_master_only)
+values (
+'reco_default_public_schema',
+9.0,
+$sql$
+select
+  'default_public_schema_privs' as tag_reco_topic,
+  nspname::text as tag_object_name,
+  'REVOKE CREATE ON SCHEMA public FROM PUBLIC;' as recommendation,
+  'only authorized users should be allowed to create new objects' as extra_info
+from
+  pg_namespace
+where
+  nspname = 'public'
+  and nspacl::text ~ E'[,\\{]+=U?C/'
+;
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_master_only)
+values (
+'reco_drop_index',
+9.0,
+$sql$
+/* assumes the pg_qualstats extension */
+select
+  'drop_index' as tag_reco_topic,
+  quote_ident(schemaname)||'.'||quote_ident(indexrelname) as tag_object_name,
+  'DROP INDEX ' || quote_ident(schemaname)||'.'||quote_ident(indexrelname) || ';' as recommendation,
+  'NB! Before dropping make sure to also check replica pg_stat_user_indexes.idx_scan count if using them for queries' as extra_info
+from
+  pg_stat_user_indexes
+  join
+  pg_index using (indexrelid)
+where
+  idx_scan = 0
+  and ((pg_relation_size(indexrelid)::numeric / (pg_database_size(current_database()))) > 0.005 /* 0.5% DB size threshold */
+    or indisvalid)
+  and not indisprimary
+;
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_master_only)
+values (
+'reco_drop_index',
+9.4,
+$sql$
+/* assumes the pg_qualstats extension */
+select
+  'drop_index' as tag_reco_topic,
+  quote_ident(schemaname)||'.'||quote_ident(indexrelname) as tag_object_name,
+  'DROP INDEX ' || quote_ident(schemaname)||'.'||quote_ident(indexrelname) || ';' as recommendation,
+  'NB! Make sure to also check replica pg_stat_user_indexes.idx_scan count if using them for queries' as extra_info
+from
+  pg_stat_user_indexes
+  join
+  pg_index using (indexrelid)
+where
+  idx_scan = 0
+  and ((pg_relation_size(indexrelid)::numeric / (pg_database_size(current_database()))) > 0.005 /* 0.5% DB size threshold */
+    or indisvalid)
+  and not indisprimary
+  and not indisreplident
+;
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_master_only)
+values (
+'reco_nested_views',
+9.0,
+$sql$
+WITH RECURSIVE views AS (
+   -- get the directly depending views
+   SELECT v.oid::regclass AS view,
+          format('%s.%s', quote_ident(n.nspname), quote_ident(v.relname)) as full_name,
+          1 AS level
+   FROM pg_depend AS d
+      JOIN pg_rewrite AS r
+         ON r.oid = d.objid
+      JOIN pg_class AS v
+         ON v.oid = r.ev_class
+      JOIN pg_namespace AS n
+         ON n.oid = v.relnamespace
+   WHERE v.relkind = 'v'
+     AND NOT n.nspname = ANY(array['information_schema', E'pg\\_%'])
+     AND NOT v.relname LIKE E'pg\\_%'
+     AND d.classid = 'pg_rewrite'::regclass
+     AND d.refclassid = 'pg_class'::regclass
+     AND d.deptype = 'n'
+UNION ALL
+   -- add the views that depend on these
+   SELECT v.oid::regclass,
+          format('%s.%s', quote_ident(n.nspname), quote_ident(v.relname)) as full_name,
+          views.level + 1
+   FROM views
+      JOIN pg_depend AS d
+         ON d.refobjid = views.view
+      JOIN pg_rewrite AS r
+         ON r.oid = d.objid
+      JOIN pg_class AS v
+         ON v.oid = r.ev_class
+      JOIN pg_namespace AS n
+         ON n.oid = v.relnamespace
+   WHERE v.relkind = 'v'
+     AND NOT n.nspname = ANY(array['information_schema', E'pg\\_%'])
+     AND d.classid = 'pg_rewrite'::regclass
+     AND d.refclassid = 'pg_class'::regclass
+     AND d.deptype = 'n'
+     AND v.oid <> views.view  -- avoid loop
+)
+SELECT
+  'overly_nested_views'::text AS tag_reco_topic,
+  full_name as tag_object_name,
+  'overly nested views can affect performance' recommendation,
+  'nesting_depth: ' || max(level) AS extra_info
+FROM views
+GROUP BY 1, 2
+HAVING max(level) > 5
+ORDER BY max(level) DESC;
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_master_only)
+values (
+'reco_sprocs_wo_search_path',
+9.0,
+$sql$
+with q_sprocs as (
+select
+  format('%s.%s', quote_ident(nspname), quote_ident(proname)) as sproc_name,
+  'alter function ' || proname || '(' || pg_get_function_arguments(p.oid) || ') set search_path = X;' as fix_sql
+from
+  pg_proc p
+  join pg_namespace n on n.oid = p.pronamespace
+  where prosecdef and not 'search_path' = ANY(coalesce(proconfig, '{}'::text[]))
+  and not pg_catalog.obj_description(p.oid, 'pg_proc') ~ 'pgwatch2'
+)
+select
+  'sprocs_wo_search_path' as tag_reco_topic,
+  sproc_name as tag_object_name,
+  fix_sql as recommendation,
+  'functions without fixed search_path can be potentially abused by malicious users if used objects are not fully qualified' as extra_info
+from
+  q_sprocs
+order by
+   tag_object_name, extra_info;
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_master_only)
+values (
+'reco_superusers',
+9.0,
+$sql$
+/* reco_* metrics have special handling - all results are stored actually under one 'recommendations' metric  and
+ following text columns are expected:  reco_topic, object_name, recommendation, extra_info.
+*/
+with q_su as (
+  select count(*) from pg_roles where rolcanlogin and rolsuper
+),
+q_total as (
+  select count(*) from pg_roles where rolcanlogin
+)
+select
+  'superuser_count'::text as tag_reco_topic,
+  '-' as tag_object_name,
+  'too many superusers detected - review recommended' as recommendation,
+  format('%s active superusers, %s total active users', q_su.count, q_total.count) as extra_info
+from
+  q_su, q_total
+where
+  q_su.count >= 10
+;
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
+);
+
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_master_only)
+values (
+'show_plans_realtime',
+9.0,
+$sql$
+/* assumes pg_show_plans extension */
+select
+  max((extract(epoch from now()) * 1e9)::int8) as epoch_ns,
+  max(extract(epoch from now() - query_start))::int as max_s,
+  avg(extract(epoch from now() - query_start))::int as avg_s,
+  count(*),
+  array_to_string(array_agg(distinct usename order by usename), ',') as "users",
+  max(md5(plan)) as tag_hash, /* needed for influx */
+  plan,
+  max(query) as query
+from
+  pg_show_plans p
+  join
+  pg_stat_activity a
+    using (pid)
+where
+  p.pid != pg_backend_pid()
+  and datname = current_database()
+  and now() - query_start > '1s'::interval
+group by
+  plan
+order by
+  max_s desc
+limit
+  10
+;
+$sql$,
+'{"prometheus_all_gauge_columns": true}',
+true
+);
