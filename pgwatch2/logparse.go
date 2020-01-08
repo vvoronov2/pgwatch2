@@ -2,10 +2,10 @@ package main
 
 import (
 	"bufio"
-	"regexp"
-	"strings"
-
 	"io"
+	"regexp"
+	"strconv"
+	"strings"
 
 	//	"io"
 	"os"
@@ -17,37 +17,10 @@ import (
 var logFilesToTail = make(chan string, 10000) // main loop adds, worker fetches
 var logFilesToTailLock = sync.RWMutex{}
 var lastParsedLineTimestamp time.Time
-var PG_SEVERITIES = [...]string{"DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "INFO", "NOTICE", "WARNING", "ERROR", "LOG", "FATAL", "PANIC"}
-var PG_SEVERITIES_MAP = map[string]int{"DEBUG5": 1, "DEBUG4": 2, "DEBUG3": 3, "DEBUG2": 4, "DEBUG1": 5, "INFO": 6, "NOTICE": 7, "WARNING": 8, "ERROR": 9, "LOG": 10, "FATAL": 11, "PANIC": 12}
+var PG_SEVERITIES = [...]string{"DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "LOG", "FATAL", "PANIC"}
 
-const DEFAULT_LOG_SEVERITY = "WARNING"
 const CSVLOG_DEFAULT_REGEX  = `^^(?P<log_time>.*?),"?(?P<user_name>.*?)"?,"?(?P<database_name>.*?)"?,(?P<process_id>\d+),"?(?P<connection_from>.*?)"?,(?P<session_id>.*?),(?P<session_line_num>\d+),"?(?P<command_tag>.*?)"?,(?P<session_start_time>.*?),(?P<virtual_transaction_id>.*?),(?P<transaction_id>.*?),(?P<error_severity>\w+),`
 
-type Client struct { // Our example struct, you can use "-" to ignore a field
-	log_time               string `csv:"log_time"`
-	user_name              string `csv:"user_name"`
-	database_name          string `csv:"database_name"`
-	process_id             string `csv:"process_id"`
-	connection_from        string `csv:"connection_from"`
-	session_id             string `csv:"session_id"`
-	session_line_num       string `csv:"session_line_num"`
-	command_tag            string `csv:"command_tag"`
-	session_start_time     string `csv:"session_start_time"`
-	virtual_transaction_id string `csv:"virtual_transaction_id"`
-	transaction_id         string `csv:"transaction_id"`
-	error_severity         string `csv:"error_severity"`
-	sql_state_code         string `csv:"sql_state_code"`
-	message                string `csv:"message"`
-	detail                 string `csv:"detail"`
-	hint                   string `csv:"hint"`
-	internal_query         string `csv:"internal_query"`
-	internal_query_pos     string `csv:"internal_query_pos"`
-	context                string `csv:"context"`
-	query                  string `csv:"query"`
-	query_pos              string `csv:"query_pos"`
-	location               string `csv:"location"`
-	application_name       string `csv:"application_name"`
-}
 
 func getFileWithLatestTimestamp(files []string) (string, time.Time) {
 	var maxDate time.Time
@@ -102,35 +75,12 @@ func getFileWithNextModTimestamp(dbUniqueName, logsGlobPath, currentFile string)
 	return nextFile, nextMod
 }
 
-func SeverityIsGreaterOrEqualTo(severity, threshold string) bool {
-	thresholdPassed := false
-	for _, s := range PG_SEVERITIES {
-		if s == threshold {
-			thresholdPassed = true
-			break
-		} else if s == severity {
-			return false
-		}
-	}
-	if thresholdPassed {
-		return true
-	} else {
-		log.Fatal("Should not happen")
-	}
-	return false
-}
-
-func eventCountsToMetricStoreMessages(eventCounts map[string]int64, logsMinSeverity string, mdb MonitoredDatabase) []MetricStoreMessage {
-	thresholdPassed := false
+// 1. add zero counts for severity levels that didn't have any occurrences in the log
+// TODO calculate also hourly rate values to simplify dashboarding and alerting queries in Grafana
+func eventCountsToMetricStoreMessages(eventCounts map[string]int64, mdb MonitoredDatabase) []MetricStoreMessage {
 	allSeverityCounts := make(map[string]interface{})
 
 	for _, s := range PG_SEVERITIES {
-		if s == logsMinSeverity {
-			thresholdPassed = true
-		}
-		if !thresholdPassed {
-			continue
-		}
 		parsedCount, ok := eventCounts[s]
 		if ok {
 			allSeverityCounts[strings.ToLower(s)] = parsedCount
@@ -154,7 +104,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 	var latestHandle *os.File
 	var reader *bufio.Reader
 	var linesRead = 0							// to skip over already parsed lines on Postgres server restart for example
-    var logsMatchRegex, logsMatchRegexPrev, logsGlobPath, logsMinSeverity string
+    var logsMatchRegex, logsMatchRegexPrev, logsGlobPath string
 	var lastSendTime time.Time               // to storage channel
 	var lastConfigRefreshTime time.Time      // MonitoredDatabase info
 	var eventCounts = make(map[string]int64) // [WARNING: 34, ERROR: 10, ...], re-created on storage send
@@ -207,20 +157,6 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				log.Warningf("[%s] Could not determine Postgres logs parsing folder. Configured logs_glob_path = %s", dbUniqueName, logsGlobPath)
 				time.Sleep(60 * time.Second)
 				continue
-			}
-		}
-
-		logsMinSeverity = hostConfig.LogsMinSeverity
-		if logsMinSeverity == "" {
-			logsMinSeverity = DEFAULT_LOG_SEVERITY
-			log.Infof("[%s] Using default min. log severity (%s) as host_config.logs_min_severity not specified", dbUniqueName, DEFAULT_LOG_SEVERITY)
-		} else {
-			_, ok := PG_SEVERITIES_MAP[logsMinSeverity]
-			if !ok {
-				logsMinSeverity = DEFAULT_LOG_SEVERITY
-				log.Infof("[%s] Invalid logs_min_severity (%s) specified, using default min. log severity: %s", dbUniqueName, hostConfig.LogsMinSeverity, DEFAULT_LOG_SEVERITY)
-			} else {
-				log.Debugf("[%s] Configured logs min. error_severity: %s", dbUniqueName, logsMinSeverity)
 			}
 		}
 
@@ -346,32 +282,29 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 			}
 
 			if err == nil && line != "" {
+				if _, err := strconv.Atoi(line[0:1]); err != nil {	// avoid more expensive regex check if 1st char is not a number, i.e. beginning of a new entry
+					goto send_to_storage_if_needed
+				}
 
 				matches := csvlogRegex.FindStringSubmatch(line)
 				if len(matches) == 0 {
 					log.Debugf("[%s] No logline regex match for line:", dbUniqueName) // normal case actually, for multiline
 					log.Debugf(line)
-					continue
+					goto send_to_storage_if_needed
 				}
 
 				result := RegexMatchesToMap(csvlogRegex, matches)
-				log.Debug("RegexMatchesToMap", result)
+				log.Debugf("RegexMatchesToMap: %+v", result)
 				severity, ok := result["error_severity"]
-				_, valid_severity := PG_SEVERITIES_MAP[severity]
-				if !ok || !valid_severity {
-					log.Warningf("Invalid logline error_severity (%s), ignoring line: %s", severity, line) // normal case actually, for multiline
-					continue
+				if !ok {
+					log.Fatal("error_severity group must be defined in parse regex:", csvlogRegex)
 				}
-				if SeverityIsGreaterOrEqualTo(severity, logsMinSeverity) {
-					//log.Debug("found matching log line")
-					//log.Debug(line)
-					eventCounts[severity]++
-				}
+				eventCounts[severity]++
 			}
-
+		send_to_storage_if_needed:
 			if lastSendTime.IsZero() || lastSendTime.Before(time.Now().Add(-1 * time.Second * time.Duration(interval))) {
 				log.Debugf("[%s] Sending log event counts for last interval to storage channel. Eventcounts: %+v", dbUniqueName, eventCounts)
-				metricStoreMessages := eventCountsToMetricStoreMessages(eventCounts, logsMinSeverity, mdb)
+				metricStoreMessages := eventCountsToMetricStoreMessages(eventCounts, mdb)
 				store_ch <- metricStoreMessages
 				eventCounts = make(map[string]int64)
 				lastSendTime = time.Now()
