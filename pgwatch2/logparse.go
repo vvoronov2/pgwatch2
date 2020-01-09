@@ -154,12 +154,16 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 		realDbname = db_pg_version_map[dbUniqueName].RealDbname	// to manage 2 sets of event counts - monitored DB + global
 		db_pg_version_map_lock.RUnlock()
 
-		logsMatchRegex = hostConfig.LogsMatchRegex
+		if hostConfig.LogsMatchRegex != "" {
+			logsMatchRegex = hostConfig.LogsMatchRegex
+		}
 		if logsMatchRegex == "" {
-			log.Debugf("[%s] Setting default logparse regex", dbUniqueName)
+			log.Debugf("[%s] Log parsing enabled with default CSVLOG regex", dbUniqueName)
 			logsMatchRegex = CSVLOG_DEFAULT_REGEX
 		}
-		logsGlobPath = hostConfig.LogsGlobPath
+		if hostConfig.LogsGlobPath != "" {
+			logsGlobPath = hostConfig.LogsGlobPath
+		}
 		if logsGlobPath == "" {
 			logsGlobPath = tryDetermineLogFolder(mdb)
 			if logsGlobPath == "" {
@@ -176,7 +180,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				time.Sleep(60 * time.Second)
 				continue
 			} else {
-				log.Infof("[%s] Log parsing enabled. Setting logs parse regex to: %s", dbUniqueName, logsMatchRegex)
+				log.Infof("[%s] Changing logs parsing regex to: %s", dbUniqueName, logsMatchRegex)
 				logsMatchRegexPrev = logsMatchRegex
 			}
 		}
@@ -264,7 +268,7 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 			if err == io.EOF {
 				//log.Debugf("[%s] EOF reached for logfile %s", dbUniqueName, latest)
 				if eofSleepMillis < 5000 && float64(eofSleepMillis) < interval * 1000 {
-					eofSleepMillis += 1000	// progressively sleep more if nothing going on
+					eofSleepMillis += 100	// progressively sleep more if nothing going on but not more that 5s or metric interval
 				}
 				time.Sleep(time.Millisecond * time.Duration(eofSleepMillis))
 
