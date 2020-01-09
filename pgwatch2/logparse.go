@@ -6,8 +6,6 @@ import (
 	"path"
 	"regexp"
 	"strings"
-
-	//	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,6 +16,17 @@ var logFilesToTail = make(chan string, 10000) // main loop adds, worker fetches
 var logFilesToTailLock = sync.RWMutex{}
 var lastParsedLineTimestamp time.Time
 var PG_SEVERITIES = [...]string{"DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "LOG", "FATAL", "PANIC"}
+var PG_SEVERITIES_LOCALE = map[string]map[string]string{
+	"de": {"DEBUG": "DEBUG", "LOG": "LOG", "INFO": "INFO", "HINWEIS": "NOTICE", "WARNUNG": "WARNING", "FEHLER": "ERROR", "FATAL": "FATAL", "PANIK": "PANIC"},
+	"fr": {"DEBUG": "DEBUG", "LOG": "LOG", "INFO": "INFO", "NOTICE": "NOTICE", "ATTENTION": "WARNING", "ERREUR": "ERROR", "FATAL": "FATAL", "PANIK": "PANIC"},
+	"it": {"DEBUG": "DEBUG", "LOG": "LOG", "INFO": "INFO", "NOTIFICA": "NOTICE", "ATTENZIONE": "WARNING", "ERRORE": "ERROR", "FATALE": "FATAL", "PANICO": "PANIC"},
+	"ko": {"디버그": "DEBUG", "로그": "LOG", "정보": "INFO", "알림": "NOTICE", "경고": "WARNING", "오류": "ERROR", "치명적오류": "FATAL", "손상": "PANIC"},
+	"pl": {"DEBUG": "DEBUG", "DZIENNIK": "LOG", "INFORMACJA": "INFO", "UWAGA": "NOTICE", "OSTRZEŻENIE": "WARNING", "BŁĄD": "ERROR", "KATASTROFALNY": "FATAL", "PANIKA": "PANIC"},
+	"ru": {"ОТЛАДКА": "DEBUG", "СООБЩЕНИЕ": "LOG", "ИНФОРМАЦИЯ": "INFO", "ЗАМЕЧАНИЕ": "NOTICE", "ПРЕДУПРЕЖДЕНИЕ": "WARNING", "ОШИБКА": "ERROR", "ВАЖНО": "FATAL", "ПАНИКА": "PANIC"},
+	"sv": {"DEBUG": "DEBUG", "LOGG": "LOG", "INFO": "INFO", "NOTIS": "NOTICE", "VARNING": "WARNING", "FEL": "ERROR", "FATALT": "FATAL", "PANIK": "PANIC"},
+	"tr": {"DEBUG": "DEBUG", "LOG": "LOG", "BİLGİ": "INFO", "NOT": "NOTICE", "UYARI": "WARNING", "HATA": "ERROR", "ÖLÜMCÜL (FATAL)": "FATAL", "KRİTİK": "PANIC"},
+	"zh": {"调试": "DEBUG", "日志": "LOG", "信息": "INFO", "注意": "NOTICE", "警告": "WARNING", "错误": "ERROR", "致命错误": "FATAL", "比致命错误还过分的错误": "PANIC"},
+}
 
 const CSVLOG_DEFAULT_REGEX  = `^^(?P<log_time>.*?),"?(?P<user_name>.*?)"?,"?(?P<database_name>.*?)"?,(?P<process_id>\d+),"?(?P<connection_from>.*?)"?,(?P<session_id>.*?),(?P<session_line_num>\d+),"?(?P<command_tag>.*?)"?,(?P<session_start_time>.*?),(?P<virtual_transaction_id>.*?),(?P<transaction_id>.*?),(?P<error_severity>\w+),`
 const POSTGRESQL_LOG_PARSING_METRIC_NAME = "server_log_event_counts"
@@ -104,7 +113,7 @@ func eventCountsToMetricStoreMessages(eventCounts, eventCountsTotal map[string]i
 
 func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64, control_ch <-chan ControlMessage, store_ch chan<- []MetricStoreMessage) {
 
-	var latest, previous, realDbname string
+	var latest, previous, realDbname, serverMessagesLang string
 	var latestHandle *os.File
 	var reader *bufio.Reader
 	var linesRead = 0							// to skip over already parsed lines on Postgres server restart for example
@@ -171,6 +180,12 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 				time.Sleep(60 * time.Second)
 				continue
 			}
+		}
+		serverMessagesLang = tryDetermineLogMessagesLanguage(mdb)
+		if serverMessagesLang == "" {
+			log.Warningf("[%s] Could not determine language (lc_collate) used for server logs, cannot parse logs...", dbUniqueName)
+			time.Sleep(60 * time.Second)
+			continue
 		}
 
 		if logsMatchRegexPrev != logsMatchRegex {	// avoid regex recompile if no changes
@@ -294,19 +309,23 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 
 				matches := csvlogRegex.FindStringSubmatch(line)
 				if len(matches) == 0 {
-					log.Debugf("[%s] No logline regex match for line:", dbUniqueName) // normal case actually, for multiline
+					//log.Debugf("[%s] No logline regex match for line:", dbUniqueName) // normal case actually for queries spanning multiple loglines
 					//log.Debugf(line)
 					goto send_to_storage_if_needed
 				}
 
 				result := RegexMatchesToMap(csvlogRegex, matches)
-				log.Debugf("RegexMatchesToMap: %+v", result)
+				//log.Debugf("RegexMatchesToMap: %+v", result)
 				error_severity, ok := result["error_severity"]
 				if !ok {
 					log.Error("error_severity group must be defined in parse regex:", csvlogRegex)
 					time.Sleep(time.Minute)
 					break
 				}
+				if serverMessagesLang != "en" {
+					error_severity = severityToEnglish(serverMessagesLang, error_severity)
+				}
+
 				database_name, ok := result["database_name"]
 				if !ok {
 					log.Error("database_name group must be defined in parse regex:", csvlogRegex)
@@ -334,6 +353,20 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 
 }
 
+func severityToEnglish(serverLang, errorSeverity string) string {
+	//log.Debug("severityToEnglish", serverLang, errorSeverity)
+	if serverLang == "en" {
+		return errorSeverity
+	}
+	severityMap, _ := PG_SEVERITIES_LOCALE[serverLang]
+	severityEn, ok := severityMap[errorSeverity]
+	if !ok {
+		log.Warningf("Failed to map severity '%s' to english from language '%s'", errorSeverity, serverLang)
+		return errorSeverity
+	}
+	return severityEn
+}
+
 func ZeroEventCounts(eventCounts map[string]int64) {
 	for _, severity := range PG_SEVERITIES {
 		eventCounts[severity] = 0
@@ -356,6 +389,24 @@ func tryDetermineLogFolder(mdb MonitoredDatabase) string {
 		return path.Join(ld, CSVLOG_DEFAULT_GLOB_SUFFIX)
 	}
 	return path.Join(dd, ld, CSVLOG_DEFAULT_GLOB_SUFFIX)
+}
+
+func tryDetermineLogMessagesLanguage(mdb MonitoredDatabase) string {
+	sql := `select current_setting('lc_messages')::varchar(2) as lc_messages;`
+
+	log.Debugf("[%s] Trying to determine server log messages language...", mdb.DBUniqueName)
+	data, err, _ := DBExecReadByDbUniqueName(mdb.DBUniqueName, "", false, sql)
+	if err != nil {
+		log.Errorf("[%s] Failed to lc_messages settings: %s", mdb.DBUniqueName, err)
+		return ""
+	}
+	lang := data[0]["lc_messages"].(string)
+	_, ok := PG_SEVERITIES_LOCALE[lang]
+	if !ok {
+		log.Warningf("[%s] Server log language '%s' is not yet mapped, assuming severities in english: %+v", mdb.DBUniqueName, lang, PG_SEVERITIES)
+		return "en"
+	}
+	return lang
 }
 
 func RegexMatchesToMap(csvlogRegex *regexp.Regexp, matches []string) map[string]string {
