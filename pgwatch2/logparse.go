@@ -187,13 +187,11 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 
 		log.Debugf("[%s] Considering log files determined by glob pattern: %s", dbUniqueName, logsGlobPath)
 
-		// set up inotify TODO
-		// kuidas saab hakkama weekly recyclega ?
 		if latest == "" || firstRun {
 
 			globMatches, err := filepath.Glob(logsGlobPath)
 			if err != nil || len(globMatches) == 0 {
-				log.Infof("[%s] No logfiles found to parse. Sleeping 60s...", dbUniqueName)
+				log.Infof("[%s] No logfiles found to parse from glob '%s'. Sleeping 60s...", dbUniqueName, logsGlobPath)
 				time.Sleep(60 * time.Second)
 				continue
 			}
@@ -208,7 +206,6 @@ func logparseLoop(dbUniqueName, metricName string, config_map map[string]float64
 					continue
 				}
 
-				//logFilesToTail <- latest
 			} else if len(globMatches) == 1  {
 				latest = globMatches[0]
 			}
