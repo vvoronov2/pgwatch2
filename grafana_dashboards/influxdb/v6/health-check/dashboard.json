@@ -3677,7 +3677,7 @@
         {
           "targetBlank": true,
           "title": "DB overview",
-          "url": "/dashboard/db/db-overview?$__all_variables&panelId=9&fullscreen"
+          "url": "/dashboard/db/db-overview?$__all_variables&panelId=18&fullscreen"
         }
       ],
       "mappingType": 1,
@@ -4555,7 +4555,7 @@
       "valueName": "current"
     },
     {
-      "content": "Brought to you by: <a href=\"https://www.cybertec-postgresql.com/en/\"><img src=\"https://www.cybertec-postgresql.com/wp-content/uploads/2019/05/Cybertec_Logo_wei%C3%9F-transparent_300x80px-01.png\" alt=\"Cybertec – The PostgreSQL Database Company\"></a>",
+      "content": "Brought to you by: <a href=\"https://www.cybertec-postgresql.com/en/\"><img src=\"https://www.cybertec-postgresql.com/wp-content/uploads/2020/11/CYBERTEC_RGB_300x80px.png\" alt=\"Cybertec – The PostgreSQL Database Company\"></a>",
       "gridPos": {
         "h": 4,
         "w": 24,

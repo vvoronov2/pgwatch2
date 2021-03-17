@@ -1,6 +1,14 @@
 pgwatch2:
+  service:
+    type: ClusterIP
+    servicePort: 8081 # the health-check / status port
+  ingress:
+    enabled: false
+    annotations: {}
+    host: pgwatch2-grafana.local
+    tls: []
   testDBEnabled: true
-  datastore: postgres
+  datastore: influx
   persistentVolumes:
     config:
       enabled: true
@@ -9,7 +17,7 @@ pgwatch2:
         - ReadWriteOnce
       existingClaim: ""
       mountPath: /pgwatch2/persistent-config
-      size: 2Gi
+      size: 1Gi
     database:
       enabled: true
       annotations: {}
@@ -17,7 +25,23 @@ pgwatch2:
         - ReadWriteOnce
       existingClaim: ""
       mountPath: /var/lib/postgresql
-      size: 4Gi
+      size: 2Gi
+    influx:
+      enabled: true
+      annotations: {}
+      accessModes:
+        - ReadWriteOnce
+      existingClaim: ""
+      mountPath: /var/lib/influxdb
+      size: 10Gi
+    grafana:
+      enabled: true
+      annotations: {}
+      accessModes:
+        - ReadWriteOnce
+      existingClaim: ""
+      mountPath: /var/lib/grafana
+      size: 2Gi
 
 web:
   service:
@@ -51,7 +75,6 @@ grafana:
     #    hosts:
     #      - pgwatch2-grafana.local
 
-
 exporter:
   service:
     type: ClusterIP
@@ -69,8 +92,8 @@ exporter:
 replicaCount: 1
 
 image:
-  repository: cybertec/pgwatch2-postgres
-  tag: 1.8.0
+  repository: cybertec/pgwatch2-nonroot
+  tag: 1.8.3
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

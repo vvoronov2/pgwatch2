@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/mem"
 	"io"
 	"io/ioutil"
 	"math"
@@ -25,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/coreos/go-systemd/daemon"
@@ -34,6 +37,8 @@ import (
 	"github.com/lib/pq"
 	"github.com/marpaia/graphite-golang"
 	"github.com/op/go-logging"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shopspring/decimal"
 	"golang.org/x/crypto/pbkdf2"
 	"gopkg.in/yaml.v2"
@@ -116,10 +121,10 @@ type MetricAttrs struct {
 	IsInstanceLevel           bool                 `yaml:"is_instance_level"`
 	MetricStorageName         string               `yaml:"metric_storage_name"`
 	ExtensionVersionOverrides []ExtensionOverrides `yaml:"extension_version_based_overrides"`
-	IsPrivate                 bool                 `yaml:"is_private"`     // used only for extension overrides currently and ignored otherwise
-	DisabledDays              string               `yaml:"disabled_days"`  // Cron style, 0 = Sunday. Ranges allowed: 0,2-4
-	DisableTimes              []string             `yaml:"disabled_times"` // "11:00-13:00"
-	StatementTimeoutSeconds   int64                `yaml:"statement_timeout_seconds"`	// overrides per monitored DB settings
+	IsPrivate                 bool                 `yaml:"is_private"`                // used only for extension overrides currently and ignored otherwise
+	DisabledDays              string               `yaml:"disabled_days"`             // Cron style, 0 = Sunday. Ranges allowed: 0,2-4
+	DisableTimes              []string             `yaml:"disabled_times"`            // "11:00-13:00"
+	StatementTimeoutSeconds   int64                `yaml:"statement_timeout_seconds"` // overrides per monitored DB settings
 }
 
 type MetricVersionProperties struct {
@@ -137,12 +142,12 @@ type ControlMessage struct {
 }
 
 type MetricFetchMessage struct {
-	DBUniqueName     string
-	DBUniqueNameOrig string
-	MetricName       string
-	DBType           string
-	Interval         time.Duration
-	CreatedOn        time.Time
+	DBUniqueName        string
+	DBUniqueNameOrig    string
+	MetricName          string
+	DBType              string
+	Interval            time.Duration
+	CreatedOn           time.Time
 	StmtTimeoutOverride int64
 }
 
@@ -228,6 +233,7 @@ const DBTYPE_BOUNCER = "pgbouncer"
 const DBTYPE_PGPOOL = "pgpool"
 const DBTYPE_PATRONI = "patroni"
 const DBTYPE_PATRONI_CONT = "patroni-continuous-discovery"
+const DBTYPE_PATRONI_NAMESPACE_DISCOVERY = "patroni-namespace-discovery"
 const MONITORED_DBS_DATASTORE_SYNC_INTERVAL_SECONDS = 600         // write actively monitored DBs listing to metrics store after so many seconds
 const MONITORED_DBS_DATASTORE_SYNC_METRIC_NAME = "configured_dbs" // FYI - for Postgres datastore there's also the admin.all_unique_dbnames table with all recent DB unique names with some metric data
 const RECO_PREFIX = "reco_"                                       // special handling for metrics with such prefix, data stored in RECO_METRIC_NAME
@@ -236,13 +242,24 @@ const SPECIAL_METRIC_CHANGE_EVENTS = "change_events"
 const SPECIAL_METRIC_SERVER_LOG_EVENT_COUNTS = "server_log_event_counts"
 const SPECIAL_METRIC_PGBOUNCER_STATS = "pgbouncer_stats"
 const SPECIAL_METRIC_PGPOOL_STATS = "pgpool_stats"
+const SPECIAL_METRIC_INSTANCE_UP = "instance_up"
+const METRIC_CPU_LOAD = "cpu_load"
+const METRIC_PSUTIL_CPU = "psutil_cpu"
+const METRIC_PSUTIL_DISK = "psutil_disk"
+const METRIC_PSUTIL_DISK_IO_TOTAL = "psutil_disk_io_total"
+const METRIC_PSUTIL_MEM = "psutil_mem"
+const DEFAULT_METRICS_DEFINITION_PATH_PKG = "/etc/pgwatch2/metrics" // prebuilt packages / Docker default location
+const DEFAULT_METRICS_DEFINITION_PATH_DOCKER = "/pgwatch2/metrics"  // prebuilt packages / Docker default location
 
-var dbTypeMap = map[string]bool{DBTYPE_PG: true, DBTYPE_PG_CONT: true, DBTYPE_BOUNCER: true, DBTYPE_PATRONI: true, DBTYPE_PATRONI_CONT: true, DBTYPE_PGPOOL: true}
-var dbTypes = []string{DBTYPE_PG, DBTYPE_PG_CONT, DBTYPE_BOUNCER, DBTYPE_PATRONI, DBTYPE_PATRONI_CONT} // used for informational purposes
+var dbTypeMap = map[string]bool{DBTYPE_PG: true, DBTYPE_PG_CONT: true, DBTYPE_BOUNCER: true, DBTYPE_PATRONI: true, DBTYPE_PATRONI_CONT: true, DBTYPE_PGPOOL: true, DBTYPE_PATRONI_NAMESPACE_DISCOVERY: true}
+var dbTypes = []string{DBTYPE_PG, DBTYPE_PG_CONT, DBTYPE_BOUNCER, DBTYPE_PATRONI, DBTYPE_PATRONI_CONT, DBTYPE_PATRONI_NAMESPACE_DISCOVERY} // used for informational purposes
 var specialMetrics = map[string]bool{RECO_METRIC_NAME: true, SPECIAL_METRIC_CHANGE_EVENTS: true, SPECIAL_METRIC_SERVER_LOG_EVENT_COUNTS: true}
+var directlyFetchableOSMetrics = map[string]bool{METRIC_PSUTIL_CPU: true, METRIC_PSUTIL_DISK: true, METRIC_PSUTIL_DISK_IO_TOTAL: true, "psutil_mem": true, METRIC_CPU_LOAD: true}
 var configDb *sqlx.DB
 var metricDb *sqlx.DB
 var graphiteConnection *graphite.Graphite
+var graphite_host string
+var graphite_port int
 var log = logging.MustGetLogger("main")
 var metric_def_map map[string]map[decimal.Decimal]MetricVersionProperties
 var metric_def_map_lock = sync.RWMutex{}
@@ -260,7 +277,7 @@ var last_sql_fetch_error sync.Map
 var influx_host_count = 1
 var InfluxConnectStrings [2]string // Max. 2 Influx metrics stores currently supported
 // secondary Influx meant for HA or Grafana load balancing for 100+ instances with lots of alerts
-var fileBased = false
+var fileBasedMetrics = false
 var adHocMode = false
 var preset_metric_def_map map[string]map[string]float64 // read from metrics folder in "file mode"
 /// internal statistics calculation
@@ -294,6 +311,14 @@ var instanceMetricCacheTimestampLock = sync.RWMutex{}
 var MinExtensionInfoAvailable, _ = decimal.NewFromString("9.1")
 var regexIsAlpha = regexp.MustCompile("^[a-zA-Z]+$")
 var rBouncerAndPgpoolVerMatch = regexp.MustCompile(`\d+\.+\d+`) // extract $major.minor from "4.1.2 (karasukiboshi)" or "PgBouncer 1.12.0"
+var tryDirectOSStats bool
+var unreachableDBsLock sync.RWMutex
+var unreachableDB = make(map[string]time.Time)
+
+// "cache" of last CPU utilization stats for GetGoPsutilCPU to get more exact results and not having to sleep
+var prevCPULoadTimeStatsLock sync.RWMutex
+var prevCPULoadTimeStats cpu.TimesStat
+var prevCPULoadTimestamp time.Time
 
 func IsPostgresDBType(dbType string) bool {
 	if dbType == DBTYPE_BOUNCER || dbType == DBTYPE_PGPOOL {
@@ -578,7 +603,7 @@ func DBExecReadByDbUniqueName(dbUnique, metricName string, useCache bool, stmtTi
 		if stmtTimeoutOverride > 0 {
 			stmtTimeout = stmtTimeoutOverride
 		}
-		if stmtTimeout > 0 {	// 0 = don't change, use DB level settings
+		if stmtTimeout > 0 { // 0 = don't change, use DB level settings
 			_, err = DBExecRead(conn, dbUnique, fmt.Sprintf("SET statement_timeout TO '%ds'", stmtTimeout))
 		}
 		if err != nil {
@@ -745,7 +770,7 @@ func GetMonitoredDatabasesFromConfigDB() ([]MonitoredDatabase, error) {
 				temp_arr = append(temp_arr, rdb.DBName)
 			}
 			log.Debugf("Resolved %d DBs with prefix \"%s\": [%s]", len(resolved), md.DBUniqueName, strings.Join(temp_arr, ", "))
-		} else if md.DBType == DBTYPE_PATRONI || md.DBType == DBTYPE_PATRONI_CONT {
+		} else if md.DBType == DBTYPE_PATRONI || md.DBType == DBTYPE_PATRONI_CONT || md.DBType == DBTYPE_PATRONI_NAMESPACE_DISCOVERY {
 			resolved, err := ResolveDatabasesFromPatroni(md)
 			if err != nil {
 				log.Errorf("Failed to resolve DBs for \"%s\": %s", md.DBUniqueName, err)
@@ -1127,12 +1152,14 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 func OldPostgresMetricsDeleter(metricAgeDaysThreshold int64, schemaType string) {
 	sqlDoesOldPartListingFuncExist := `SELECT count(*) FROM information_schema.routines WHERE routine_schema = 'admin' AND routine_name = 'get_old_time_partitions'`
 	oldPartListingFuncExists := false // if func existing (>v1.8.1) then use it to drop old partitions in smaller batches
-											// as for large setup (50+ DBs) one could reach the default "max_locks_per_transaction" otherwise
+	// as for large setup (50+ DBs) one could reach the default "max_locks_per_transaction" otherwise
 
 	ret, err := DBExecRead(metricDb, METRICDB_IDENT, sqlDoesOldPartListingFuncExist)
 	if err == nil && len(ret) > 0 && ret[0]["count"].(int64) > 0 {
 		oldPartListingFuncExists = true
 	}
+
+	time.Sleep(time.Hour * 1) // to reduce distracting log messages at startup
 
 	for {
 		// metric|metric-time|metric-dbname-time|custom
@@ -1699,6 +1726,10 @@ func ProcessRetryQueue(data_source, conn_str, conn_ident string, retry_queue *li
 		} else if data_source == DATASTORE_GRAPHITE {
 			for _, m := range msg {
 				err = SendToGraphite(m.DBUniqueName, m.MetricName, m.Data) // TODO add baching
+				if err != nil {
+					log.Info("Reconnect to graphite")
+					InitGraphiteConnection(graphite_host, graphite_port)
+				}
 			}
 		} else {
 			log.Fatal("Invalid datastore:", data_source)
@@ -2839,6 +2870,17 @@ retry_with_superuser_sql: // if 1st fetch with normal SQL fails, try with SU SQL
 				}
 			}
 
+			if msg.MetricName == SPECIAL_METRIC_INSTANCE_UP {
+				log.Debugf("[%s:%s] failed to fetch metrics. marking instance as not up: %s", msg.DBUniqueName, msg.MetricName, err)
+				data = make([]map[string]interface{}, 1)
+				data[0] = map[string]interface{}{"epoch_ns": time.Now().UnixNano(), "is_up": 0} // NB! should be updated if the "instance_up" metric definition is changed
+				goto send_to_storage_channel
+			}
+
+			if strings.Contains(err.Error(), "connection refused") {
+				SetDBUnreachableState(msg.DBUniqueName)
+			}
+
 			if retryWithSuperuserSQL && mvp.SqlSU != "" {
 				firstErr = err
 				log.Infof("[%s:%s] Normal fetch failed, re-trying to fetch with SU SQL", msg.DBUniqueName, msg.MetricName)
@@ -2864,6 +2906,7 @@ retry_with_superuser_sql: // if 1st fetch with normal SQL fails, try with SU SQL
 				data = FilterPgbouncerData(data, md.DBName, vme)
 			}
 
+			ClearDBUnreachableStateIfAny(msg.DBUniqueName)
 		}
 	}
 
@@ -2899,6 +2942,18 @@ send_to_storage_channel:
 		return []MetricStoreMessage{MetricStoreMessage{DBUniqueName: msg.DBUniqueName, MetricName: msg.MetricName, Data: data, CustomTags: md.CustomTags,
 			MetricDefinitionDetails: mvp, RealDbname: vme.RealDbname, SystemIdentifier: vme.SystemIdentifier}}, nil
 	}
+}
+
+func SetDBUnreachableState(dbUnique string) {
+	unreachableDBsLock.Lock()
+	unreachableDB[dbUnique] = time.Now()
+	unreachableDBsLock.Unlock()
+}
+
+func ClearDBUnreachableStateIfAny(dbUnique string) {
+	unreachableDBsLock.Lock()
+	delete(unreachableDB, dbUnique)
+	unreachableDBsLock.Unlock()
 }
 
 func GetFromInstanceCacheIfNotOlderThanSeconds(msg MetricFetchMessage, maxAgeSeconds int64) []map[string]interface{} {
@@ -3042,6 +3097,8 @@ func MetricGathererLoop(dbUniqueName, dbUniqueNameOrig, dbType, metricName strin
 	var last_uptime_s int64 = -1 // used for "server restarted" event detection
 	var last_error_notification_time time.Time
 	var vme DBVersionMapEntry
+	var mvp MetricVersionProperties
+	var err error
 	failed_fetches := 0
 	metricNameForStorage := metricName
 	lastDBVersionFetchTime := time.Unix(0, 0) // check DB ver. ev. 5 min
@@ -3083,10 +3140,12 @@ func MetricGathererLoop(dbUniqueName, dbUniqueNameOrig, dbType, metricName strin
 
 	for {
 		if lastDBVersionFetchTime.Add(time.Minute * time.Duration(5)).Before(time.Now()) {
-			vme, _ = DBGetPGVersion(dbUniqueName, dbType, false) // in case of errors just ignore metric "disabled" time ranges
-			lastDBVersionFetchTime = time.Now()
+			vme, err = DBGetPGVersion(dbUniqueName, dbType, false) // in case of errors just ignore metric "disabled" time ranges
+			if err != nil {
+				lastDBVersionFetchTime = time.Now()
+			}
 
-			mvp, err := GetMetricVersionProperties(metricName, vme, nil)
+			mvp, err = GetMetricVersionProperties(metricName, vme, nil)
 			if err == nil && mvp.MetricAttrs.StatementTimeoutSeconds > 0 {
 				stmtTimeoutOverride = mvp.MetricAttrs.StatementTimeoutSeconds
 			} else {
@@ -3098,13 +3157,25 @@ func MetricGathererLoop(dbUniqueName, dbUniqueNameOrig, dbType, metricName strin
 		if metricCurrentlyDisabled && opts.TestdataDays == 0 {
 			log.Debugf("[%s][%s] Ignoring fetch as metric disabled for current time range", dbUniqueName, metricName)
 		} else {
+			var metricStoreMessages []MetricStoreMessage
+			var err error
+			mfm := MetricFetchMessage{DBUniqueName: dbUniqueName, DBUniqueNameOrig: dbUniqueNameOrig, MetricName: metricName, DBType: dbType, Interval: time.Second * time.Duration(interval), StmtTimeoutOverride: stmtTimeoutOverride}
 
+			// 1st try local overrides for some metrics if operating in push mode
+			if tryDirectOSStats && IsDirectlyFetchableMetric(metricName) {
+				metricStoreMessages, err = FetchStatsDirectlyFromOS(mfm, vme, mvp)
+				if err != nil {
+					log.Errorf("[%s][%s] Could not reader metric directly from OS: %v", dbUniqueName, metricName, err)
+				}
+			}
 			t1 := time.Now()
-			metricStoreMessages, err := FetchMetrics(
-				MetricFetchMessage{DBUniqueName: dbUniqueName, DBUniqueNameOrig: dbUniqueNameOrig, MetricName: metricName, DBType: dbType, Interval: time.Second * time.Duration(interval), StmtTimeoutOverride: stmtTimeoutOverride},
-				host_state,
-				store_ch,
-				"")
+			if metricStoreMessages == nil {
+				metricStoreMessages, err = FetchMetrics(
+					mfm,
+					host_state,
+					store_ch,
+					"")
+			}
 			t2 := time.Now()
 
 			if t2.Sub(t1) > (time.Second * time.Duration(interval)) {
@@ -3207,6 +3278,57 @@ func MetricGathererLoop(dbUniqueName, dbUniqueNameOrig, dbType, metricName strin
 		}
 
 	}
+}
+
+func FetchStatsDirectlyFromOS(msg MetricFetchMessage, vme DBVersionMapEntry, mvp MetricVersionProperties) ([]MetricStoreMessage, error) {
+	var data []map[string]interface{}
+	var err error
+
+	if msg.MetricName == METRIC_CPU_LOAD { // could function pointers work here?
+		data, err = GetLoadAvgLocal()
+	} else if msg.MetricName == METRIC_PSUTIL_CPU {
+		data, err = GetGoPsutilCPU(msg.Interval)
+	} else if msg.MetricName == METRIC_PSUTIL_DISK {
+		data, err = GetGoPsutilDiskPG(msg.DBUniqueName)
+	} else if msg.MetricName == METRIC_PSUTIL_DISK_IO_TOTAL {
+		data, err = GetGoPsutilDiskTotals()
+	} else if msg.MetricName == METRIC_PSUTIL_MEM {
+		data, err = GetGoPsutilMem()
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	msm := DatarowsToMetricstoreMessage(data, msg, vme, mvp)
+	return []MetricStoreMessage{msm}, nil
+}
+
+// data + custom tags + counters
+func DatarowsToMetricstoreMessage(data []map[string]interface{}, msg MetricFetchMessage, vme DBVersionMapEntry, mvp MetricVersionProperties) MetricStoreMessage {
+	md, err := GetMonitoredDatabaseByUniqueName(msg.DBUniqueName)
+	if err != nil {
+		log.Errorf("Could not resolve DBUniqueName %s, cannot set custom attributes for gathered data: %v", msg.DBUniqueName, err)
+	}
+
+	atomic.AddUint64(&totalMetricsFetchedCounter, uint64(len(data)))
+
+	return MetricStoreMessage{
+		DBUniqueName:            msg.DBUniqueName,
+		DBType:                  msg.DBType,
+		MetricName:              msg.MetricName,
+		CustomTags:              md.CustomTags,
+		Data:                    data,
+		MetricDefinitionDetails: mvp,
+		RealDbname:              vme.RealDbname,
+		SystemIdentifier:        vme.SystemIdentifier,
+	}
+}
+
+func IsDirectlyFetchableMetric(metric string) bool {
+	if _, ok := directlyFetchableOSMetrics[metric]; ok {
+		return true
+	}
+	return false
 }
 
 func IsStringInSlice(target string, slice []string) bool {
@@ -3621,7 +3743,7 @@ func TryCreateMetricsFetchingHelpers(dbUnique string) error {
 		return err
 	}
 
-	if fileBased {
+	if fileBasedMetrics {
 		helpers, err := ReadMetricsFromFolder(path.Join(opts.MetricsFolder, FILE_BASED_METRIC_HELPERS_DIR), false)
 		if err != nil {
 			log.Errorf("Failed to fetch helpers from \"%s\": %s", path.Join(opts.MetricsFolder, FILE_BASED_METRIC_HELPERS_DIR), err)
@@ -4046,14 +4168,14 @@ func GetMonitoredDatabasesFromMonitoringConfig(mc []MonitoredDatabase) []Monitor
 			log.Warningf("Ignoring host \"%s\" as \"dbname\" attribute not specified but required by dbtype=postgres", e.DBUniqueName)
 			continue
 		}
-		if len(e.DBName) == 0 || e.DBType == DBTYPE_PG_CONT || e.DBType == DBTYPE_PATRONI || e.DBType == DBTYPE_PATRONI_CONT {
+		if len(e.DBName) == 0 || e.DBType == DBTYPE_PG_CONT || e.DBType == DBTYPE_PATRONI || e.DBType == DBTYPE_PATRONI_CONT || e.DBType == DBTYPE_PATRONI_NAMESPACE_DISCOVERY {
 			if e.DBType == DBTYPE_PG_CONT {
 				log.Debugf("Adding \"%s\" (host=%s, port=%s) to continuous monitoring ...", e.DBUniqueName, e.Host, e.Port)
 			}
 			var found_dbs []MonitoredDatabase
 			var err error
 
-			if e.DBType == DBTYPE_PATRONI || e.DBType == DBTYPE_PATRONI_CONT {
+			if e.DBType == DBTYPE_PATRONI || e.DBType == DBTYPE_PATRONI_CONT || e.DBType == DBTYPE_PATRONI_NAMESPACE_DISCOVERY {
 				found_dbs, err = ResolveDatabasesFromPatroni(e)
 			} else {
 				found_dbs, err = ResolveDatabasesFromConfigEntry(e)
@@ -4088,6 +4210,8 @@ func StatsServerHandler(w http.ResponseWriter, req *http.Request) {
 	"datastoreWriteFailuresCounter": %d,
 	"datastoreSuccessfulWritesCounter": %d,
 	"datastoreAvgSuccessfulWriteTimeMillis": %.1f,
+	"databasesMonitored": %d,
+	"unreachableDBs": %d,
 	"gathererUptimeSeconds": %d
 }
 `
@@ -4108,7 +4232,13 @@ func StatsServerHandler(w http.ResponseWriter, req *http.Request) {
 	if metricPointsPerMinute == -1 { // calculate avg. on the fly if 1st summarization hasn't happened yet
 		metricPointsPerMinute = int64((totalMetrics * 60) / gathererUptimeSeconds)
 	}
-	_, _ = io.WriteString(w, fmt.Sprintf(jsonResponseTemplate, time.Now().Unix()-secondsFromLastSuccessfulDatastoreWrite, totalMetrics, cacheMetrics, totalDatasets, metricPointsPerMinute, metricsDropped, metricFetchFailuresCounter, datastoreFailures, datastoreSuccess, datastoreAvgSuccessfulWriteTimeMillis, gathererUptimeSeconds))
+	monitored_db_cache_lock.RLock()
+	databasesMonitored := len(monitored_db_cache) // including replicas
+	monitored_db_cache_lock.RUnlock()
+	unreachableDBsLock.RLock()
+	unreachableDBs := len(unreachableDB)
+	unreachableDBsLock.RUnlock()
+	_, _ = io.WriteString(w, fmt.Sprintf(jsonResponseTemplate, time.Now().Unix()-secondsFromLastSuccessfulDatastoreWrite, totalMetrics, cacheMetrics, totalDatasets, metricPointsPerMinute, metricsDropped, metricFetchFailuresCounter, datastoreFailures, datastoreSuccess, datastoreAvgSuccessfulWriteTimeMillis, databasesMonitored, unreachableDBs, gathererUptimeSeconds))
 }
 
 func StartStatsServer(port int64) {
@@ -4205,6 +4335,278 @@ func SyncMonitoredDBsToDatastore(monitored_dbs []MonitoredDatabase, persistence_
 	}
 }
 
+func CheckFolderExistsAndReadable(path string) bool {
+	if _, err := ioutil.ReadDir(path); err != nil {
+		return false
+	}
+	return true
+}
+
+func goPsutilCalcCPUUtilization(probe0, probe1 cpu.TimesStat) float64 {
+	return 100 - (100.0 * (probe1.Idle - probe0.Idle + probe1.Iowait - probe0.Iowait + probe1.Steal - probe0.Steal) / (probe1.Total() - probe0.Total()))
+}
+
+// Simulates "psutil" metric output. Assumes the result from last call as input, otherwise uses a 1s measurement
+// https://github.com/cybertec-postgresql/pgwatch2/blob/master/pgwatch2/metrics/psutil_cpu/9.0/metric.sql
+func GetGoPsutilCPU(interval time.Duration) ([]map[string]interface{}, error) {
+	prevCPULoadTimeStatsLock.RLock()
+	prevTime := prevCPULoadTimestamp
+	prevTimeStat := prevCPULoadTimeStats
+	prevCPULoadTimeStatsLock.RUnlock()
+
+	if prevTime.IsZero() || (time.Now().UnixNano()-prevTime.UnixNano()) < 1e9 { // give "short" stats on first run, based on a 1s probe
+		probe0, err := cpu.Times(false)
+		if err != nil {
+			return nil, err
+		}
+		prevTimeStat = probe0[0]
+		time.Sleep(1e9)
+	}
+
+	curCallStats, err := cpu.Times(false)
+	if err != nil {
+		return nil, err
+	}
+	if prevTime.IsZero() || time.Now().UnixNano()-prevTime.UnixNano() < 1e9 || time.Now().Unix()-prevTime.Unix() >= int64(interval.Seconds()) {
+		prevCPULoadTimeStatsLock.Lock() // update the cache
+		prevCPULoadTimeStats = curCallStats[0]
+		prevCPULoadTimestamp = time.Now()
+		prevCPULoadTimeStatsLock.Unlock()
+	}
+
+	la, err := load.Avg()
+	if err != nil {
+		return nil, err
+	}
+
+	cpus, err := cpu.Counts(true)
+	if err != nil {
+		return nil, err
+	}
+
+	retMap := make(map[string]interface{})
+	retMap["epoch_ns"] = time.Now().UnixNano()
+	retMap["cpu_utilization"] = math.Round(100*goPsutilCalcCPUUtilization(prevTimeStat, curCallStats[0])) / 100
+	retMap["load_1m_norm"] = math.Round(100*la.Load1/float64(cpus)) / 100
+	retMap["load_1m"] = math.Round(100*la.Load1) / 100
+	retMap["load_5m_norm"] = math.Round(100*la.Load5/float64(cpus)) / 100
+	retMap["load_5m"] = math.Round(100*la.Load5) / 100
+	retMap["user"] = math.Round(10000.0*(curCallStats[0].User-prevTimeStat.User)/(curCallStats[0].Total()-prevTimeStat.Total())) / 100
+	retMap["system"] = math.Round(10000.0*(curCallStats[0].System-prevTimeStat.System)/(curCallStats[0].Total()-prevTimeStat.Total())) / 100
+	retMap["idle"] = math.Round(10000.0*(curCallStats[0].Idle-prevTimeStat.Idle)/(curCallStats[0].Total()-prevTimeStat.Total())) / 100
+	retMap["iowait"] = math.Round(10000.0*(curCallStats[0].Iowait-prevTimeStat.Iowait)/(curCallStats[0].Total()-prevTimeStat.Total())) / 100
+	retMap["irqs"] = math.Round(10000.0*(curCallStats[0].Irq-prevTimeStat.Irq+curCallStats[0].Softirq-prevTimeStat.Softirq)/(curCallStats[0].Total()-prevTimeStat.Total())) / 100
+	retMap["other"] = math.Round(10000.0*(curCallStats[0].Steal-prevTimeStat.Steal+curCallStats[0].Guest-prevTimeStat.Guest+curCallStats[0].GuestNice-prevTimeStat.GuestNice)/(curCallStats[0].Total()-prevTimeStat.Total())) / 100
+
+	return []map[string]interface{}{retMap}, nil
+}
+
+func GetGoPsutilMem() ([]map[string]interface{}, error) {
+	vm, err := mem.VirtualMemory()
+	if err != nil {
+		return nil, err
+	}
+
+	retMap := make(map[string]interface{})
+	retMap["epoch_ns"] = time.Now().UnixNano()
+	retMap["total"] = int64(vm.Total)
+	retMap["used"] = int64(vm.Used)
+	retMap["free"] = int64(vm.Free)
+	retMap["buff_cache"] = int64(vm.Buffers)
+	retMap["available"] = int64(vm.Available)
+	retMap["percent"] = math.Round(100*vm.UsedPercent) / 100
+	retMap["swap_total"] = int64(vm.SwapTotal)
+	retMap["swap_used"] = int64(vm.SwapCached)
+	retMap["swap_free"] = int64(vm.SwapFree)
+	retMap["swap_percent"] = math.Round(100*float64(vm.SwapCached)/float64(vm.SwapTotal)) / 100
+
+	return []map[string]interface{}{retMap}, nil
+}
+
+func GetGoPsutilDiskTotals() ([]map[string]interface{}, error) {
+	d, err := disk.IOCounters()
+	if err != nil {
+		return nil, err
+	}
+
+	retMap := make(map[string]interface{})
+	var readBytes, writeBytes, reads, writes float64
+
+	retMap["epoch_ns"] = time.Now().UnixNano()
+	for _, v := range d { // summarize all disk devices
+		readBytes += float64(v.ReadBytes) // datatype float is just an oversight in the original psutil helper
+		// but can't change it without causing problems on storage level (InfluxDB)
+		writeBytes += float64(v.WriteBytes)
+		reads += float64(v.ReadCount)
+		writes += float64(v.WriteCount)
+	}
+	retMap["read_bytes"] = readBytes
+	retMap["write_bytes"] = writeBytes
+	retMap["read_count"] = reads
+	retMap["write_count"] = writes
+
+	return []map[string]interface{}{retMap}, nil
+}
+
+func getPathUnderlyingDeviceId(path string) (uint64, error) {
+	fp, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	fi, err := fp.Stat()
+	if err != nil {
+		return 0, err
+	}
+	stat := fi.Sys().(*syscall.Stat_t)
+	return stat.Dev, nil
+}
+
+// connects actually to the instance to determine PG relevant disk paths / mounts
+func GetGoPsutilDiskPG(dbUnique string) ([]map[string]interface{}, error) {
+	sql := `select current_setting('data_directory') as dd, current_setting('log_directory') as ld, current_setting('server_version_num')::int as pgver`
+	sqlTS := `select spcname::text as name, pg_catalog.pg_tablespace_location(oid) as location from pg_catalog.pg_tablespace where not spcname like any(array[E'pg\\_%'])`
+	var ddDevice, ldDevice, walDevice uint64
+
+	data, err, _ := DBExecReadByDbUniqueName(dbUnique, "", false, 0, sql)
+	if err != nil || len(data) == 0 {
+		log.Errorf("Failed to determine relevant PG disk paths via SQL: %v", err)
+		return nil, err
+	}
+
+	dataDirPath := data[0]["dd"].(string)
+	ddUsage, err := disk.Usage(dataDirPath)
+	if err != nil {
+		log.Errorf("Could not determine disk usage for path %v: %v", dataDirPath, err)
+		return nil, err
+	}
+
+	retRows := make([]map[string]interface{}, 0)
+	epoch_ns := time.Now().UnixNano()
+	dd := make(map[string]interface{})
+	dd["epoch_ns"] = epoch_ns
+	dd["tag_dir_or_tablespace"] = "data_directory"
+	dd["tag_path"] = dataDirPath
+	dd["total"] = float64(ddUsage.Total)
+	dd["used"] = float64(ddUsage.Used)
+	dd["free"] = float64(ddUsage.Free)
+	dd["percent"] = math.Round(100*ddUsage.UsedPercent) / 100
+	retRows = append(retRows, dd)
+
+	ddDevice, err = getPathUnderlyingDeviceId(dataDirPath)
+	if err != nil {
+		log.Errorf("Could not determine disk device ID of data_directory %v: %v", dataDirPath, err)
+	}
+
+	logDirPath := data[0]["ld"].(string)
+	if !strings.HasPrefix(logDirPath, "/") {
+		logDirPath = path.Join(dataDirPath, logDirPath)
+	}
+	if len(logDirPath) > 0 && CheckFolderExistsAndReadable(logDirPath) { // syslog etc considered out of scope
+		ldDevice, err = getPathUnderlyingDeviceId(logDirPath)
+		if err != nil {
+			log.Infof("Could not determine disk device ID of log_directory %v: %v", logDirPath, err)
+		}
+		if err != nil || ldDevice != ddDevice { // no point to report same data in case of single folder configuration
+			ld := make(map[string]interface{})
+			ldUsage, err := disk.Usage(logDirPath)
+			if err != nil {
+				log.Infof("Could not determine disk usage for path %v: %v", logDirPath, err)
+			} else {
+				ld["epoch_ns"] = epoch_ns
+				ld["tag_dir_or_tablespace"] = "log_directory"
+				ld["tag_path"] = logDirPath
+				ld["total"] = float64(ldUsage.Total)
+				ld["used"] = float64(ldUsage.Used)
+				ld["free"] = float64(ldUsage.Free)
+				ld["percent"] = math.Round(100*ldUsage.UsedPercent) / 100
+				retRows = append(retRows, ld)
+			}
+		}
+	}
+
+	var walDirPath string
+	if CheckFolderExistsAndReadable(path.Join(dataDirPath, "pg_wal")) {
+		walDirPath = path.Join(dataDirPath, "pg_wal")
+	} else if CheckFolderExistsAndReadable(path.Join(dataDirPath, "pg_xlog")) {
+		walDirPath = path.Join(dataDirPath, "pg_xlog") // < v10
+	}
+
+	if len(walDirPath) > 0 {
+		walDevice, err = getPathUnderlyingDeviceId(walDirPath)
+		if err != nil {
+			log.Infof("Could not determine disk device ID of WAL directory %v: %v", walDirPath, err) // storing anyways
+		}
+
+		if err != nil || walDevice != ddDevice || walDevice != ldDevice { // no point to report same data in case of single folder configuration
+			walUsage, err := disk.Usage(walDirPath)
+			if err != nil {
+				log.Errorf("Could not determine disk usage for WAL directory %v: %v", walDirPath, err)
+			} else {
+				wd := make(map[string]interface{})
+				wd["epoch_ns"] = epoch_ns
+				wd["tag_dir_or_tablespace"] = "pg_wal"
+				wd["tag_path"] = walDirPath
+				wd["total"] = float64(walUsage.Total)
+				wd["used"] = float64(walUsage.Used)
+				wd["free"] = float64(walUsage.Free)
+				wd["percent"] = math.Round(100*walUsage.UsedPercent) / 100
+				retRows = append(retRows, wd)
+			}
+		}
+	}
+
+	data, err, _ = DBExecReadByDbUniqueName(dbUnique, "", false, 0, sqlTS)
+	if err != nil {
+		log.Infof("Failed to determine relevant PG tablespace paths via SQL: %v", err)
+	} else if len(data) > 0 {
+		for _, row := range data {
+			tsPath := row["location"].(string)
+			tsName := row["name"].(string)
+
+			tsDevice, err := getPathUnderlyingDeviceId(tsPath)
+			if err != nil {
+				log.Errorf("Could not determine disk device ID of tablespace %s (%s): %v", tsName, tsPath, err)
+				continue
+			}
+
+			if tsDevice == ddDevice || tsDevice == ldDevice || tsDevice == walDevice {
+				continue
+			}
+			tsUsage, err := disk.Usage(tsPath)
+			if err != nil {
+				log.Errorf("Could not determine disk usage for tablespace %s, directory %s: %v", row["name"].(string), row["location"].(string), err)
+			}
+			ts := make(map[string]interface{})
+			ts["epoch_ns"] = epoch_ns
+			ts["tag_dir_or_tablespace"] = tsName
+			ts["tag_path"] = tsPath
+			ts["total"] = float64(tsUsage.Total)
+			ts["used"] = float64(tsUsage.Used)
+			ts["free"] = float64(tsUsage.Free)
+			ts["percent"] = math.Round(100*tsUsage.UsedPercent) / 100
+			retRows = append(retRows, ts)
+		}
+	}
+
+	return retRows, nil
+}
+
+func GetLoadAvgLocal() ([]map[string]interface{}, error) {
+	la, err := load.Avg()
+	if err != nil {
+		log.Errorf("Could not inquiry local system load average: %v", err)
+		return nil, err
+	}
+
+	row := make(map[string]interface{})
+	row["epoch_ns"] = time.Now().UnixNano()
+	row["load_1min"] = la.Load1
+	row["load_5min"] = la.Load5
+	row["load_15min"] = la.Load15
+
+	return []map[string]interface{}{row}, nil
+}
+
 type Options struct {
 	// Slice of bool will append 'true' each time the option
 	// is encountered (can be set multiple times, like -vvv)
@@ -4243,7 +4645,7 @@ type Options struct {
 	JsonStorageFile      string `long:"json-storage-file" description:"Path to file where metrics will be stored when --datastore=json, one metric set per line" env:"PW2_JSON_STORAGE_FILE"`
 	// Params for running based on local config files, enabled distributed "push model" based metrics gathering. Metrics are sent directly to Influx/Graphite.
 	Config                  string `short:"c" long:"config" description:"File or folder of YAML files containing info on which DBs to monitor and where to store metrics" env:"PW2_CONFIG"`
-	MetricsFolder           string `short:"m" long:"metrics-folder" description:"Folder of metrics definitions" env:"PW2_METRICS_FOLDER" default:"/etc/pgwatch2/metrics"`
+	MetricsFolder           string `short:"m" long:"metrics-folder" description:"Folder of metrics definitions" env:"PW2_METRICS_FOLDER"`
 	BatchingDelayMs         int64  `long:"batching-delay-ms" description:"Max milliseconds to wait for a batched metrics flush. [Default: 250]" default:"250" env:"PW2_BATCHING_MAX_DELAY_MS"`
 	AdHocConnString         string `long:"adhoc-conn-str" description:"Ad-hoc mode: monitor a single Postgres DB specified by a standard Libpq connection string" env:"PW2_ADHOC_CONN_STR"`
 	AdHocDBType             string `long:"adhoc-dbtype" description:"Ad-hoc mode: postgres|postgres-continuous-discovery" default:"postgres" env:"PW2_ADHOC_DBTYPE"`
@@ -4251,6 +4653,7 @@ type Options struct {
 	AdHocCreateHelpers      string `long:"adhoc-create-helpers" description:"Ad-hoc mode: try to auto-create helpers. Needs superuser to succeed [Default: false]" default:"false" env:"PW2_ADHOC_CREATE_HELPERS"`
 	AdHocUniqueName         string `long:"adhoc-name" description:"Ad-hoc mode: Unique 'dbname' for Influx. [Default: adhoc]" default:"adhoc" env:"PW2_ADHOC_NAME"`
 	InternalStatsPort       int64  `long:"internal-stats-port" description:"Port for inquiring monitoring status in JSON format. [Default: 8081]" default:"8081" env:"PW2_INTERNAL_STATS_PORT"`
+	DirectOSStats           string `long:"direct-os-stats" description:"Extract OS related psutil statistics not via PL/Python wrappers but directly on host [Default: off]" default:"off" env:"PW2_DIRECT_OS_STATS"`
 	ConnPooling             string `long:"conn-pooling" description:"Enable re-use of metrics fetching connections [Default: off]" default:"off" env:"PW2_CONN_POOLING"`
 	AesGcmKeyphrase         string `long:"aes-gcm-keyphrase" description:"Decryption key for AES-GCM-256 passwords" env:"PW2_AES_GCM_KEYPHRASE"`
 	AesGcmKeyphraseFile     string `long:"aes-gcm-keyphrase-file" description:"File with decryption key for AES-GCM-256 passwords" env:"PW2_AES_GCM_KEYPHRASE_FILE"`
@@ -4305,6 +4708,8 @@ func main() {
 
 	log.Debugf("opts: %+v", opts)
 
+	tryDirectOSStats = StringToBoolOrFail(opts.DirectOSStats, "--direct-os-stats")
+
 	if opts.ServersRefreshLoopSeconds <= 1 {
 		log.Fatal("--servers-refresh-loop-seconds must be greater than 1")
 	}
@@ -4343,19 +4748,10 @@ func main() {
 		if len(opts.Config) > 0 {
 			log.Fatal("Conflicting flags! --adhoc-conn-str and --config cannot be both set")
 		}
-		if len(opts.MetricsFolder) == 0 {
-			opts.MetricsFolder = "/etc/pgwatch2/metrics"
-			log.Warningf("--metrics-folder path not specified, using %s", opts.MetricsFolder)
+		if len(opts.MetricsFolder) > 0 && !CheckFolderExistsAndReadable(opts.MetricsFolder) {
+			log.Warningf("--metrics-folder \"%s\" not readable, trying 1st default paths and then Config DB to fetch metric definitions...", opts.MetricsFolder)
 		}
-		_, err := ioutil.ReadDir(opts.MetricsFolder)
-		if err != nil {
-			// try Docker image default file based metrics path
-			opts.MetricsFolder = "/pgwatch2/metrics"
-			_, err = ioutil.ReadDir(opts.MetricsFolder)
-			if err != nil {
-				log.Fatal("--adhoc-conn-str requires also --metrics-folder param")
-			}
-		}
+
 		if len(opts.User) > 0 && len(opts.Password) > 0 {
 			log.Fatal("Conflicting flags! --adhoc-conn-str and --user/--password cannot be both set")
 		}
@@ -4394,15 +4790,16 @@ func main() {
 
 	// running in config file based mode?
 	if len(opts.Config) > 0 {
-		if len(opts.MetricsFolder) == 0 {
-			opts.MetricsFolder = "/etc/pgwatch2/metrics" // prebuilt packages default location
+		if opts.MetricsFolder == "" && CheckFolderExistsAndReadable(DEFAULT_METRICS_DEFINITION_PATH_PKG) {
+			opts.MetricsFolder = DEFAULT_METRICS_DEFINITION_PATH_PKG
 			log.Warningf("--metrics-folder path not specified, using %s", opts.MetricsFolder)
-		}
-
-		// verify that metric/config paths are readable
-		_, err := ioutil.ReadDir(opts.MetricsFolder)
-		if err != nil {
-			log.Fatalf("Could not read --metrics-folder path %s: %s", opts.MetricsFolder, err)
+		} else if opts.MetricsFolder == "" && CheckFolderExistsAndReadable(DEFAULT_METRICS_DEFINITION_PATH_DOCKER) {
+			opts.MetricsFolder = DEFAULT_METRICS_DEFINITION_PATH_DOCKER
+			log.Warningf("--metrics-folder path not specified, using %s", opts.MetricsFolder)
+		} else {
+			if !CheckFolderExistsAndReadable(opts.MetricsFolder) {
+				log.Fatalf("Could not read --metrics-folder path %s", opts.MetricsFolder)
+			}
 		}
 
 		if !adHocMode {
@@ -4424,8 +4821,19 @@ func main() {
 			}
 		}
 
-		fileBased = true
-	} else {
+		fileBasedMetrics = true
+	} else if adHocMode && opts.MetricsFolder != "" && CheckFolderExistsAndReadable(opts.MetricsFolder) {
+		// don't need the Config DB connection actually for ad-hoc mode if metric definitions are there
+		fileBasedMetrics = true
+	} else if adHocMode && opts.MetricsFolder == "" && (CheckFolderExistsAndReadable(DEFAULT_METRICS_DEFINITION_PATH_PKG) || CheckFolderExistsAndReadable(DEFAULT_METRICS_DEFINITION_PATH_DOCKER)) {
+		if CheckFolderExistsAndReadable(DEFAULT_METRICS_DEFINITION_PATH_PKG) {
+			opts.MetricsFolder = DEFAULT_METRICS_DEFINITION_PATH_PKG
+		} else if CheckFolderExistsAndReadable(DEFAULT_METRICS_DEFINITION_PATH_DOCKER) {
+			opts.MetricsFolder = DEFAULT_METRICS_DEFINITION_PATH_DOCKER
+		}
+		log.Warningf("--metrics-folder path not specified, using %s", opts.MetricsFolder)
+		fileBasedMetrics = true
+	} else { // normal "Config DB" mode
 		// make sure all PG params are there
 		if opts.User == "" {
 			opts.User = os.Getenv("USER")
@@ -4492,8 +4900,10 @@ func main() {
 			if opts.GraphiteHost == "" || opts.GraphitePort == "" {
 				log.Fatal("--graphite-host/port needed!")
 			}
-			graphite_port, _ := strconv.ParseInt(opts.GraphitePort, 10, 64)
-			InitGraphiteConnection(opts.GraphiteHost, int(graphite_port))
+			port, _ := strconv.ParseInt(opts.GraphitePort, 10, 64)
+			graphite_host = opts.GraphiteHost
+			graphite_port = int(port)
+			InitGraphiteConnection(graphite_host, graphite_port)
 			log.Info("starting GraphitePersister...")
 			go MetricsPersister(DATASTORE_GRAPHITE, persist_ch)
 		} else if opts.Datastore == DATASTORE_INFLUX {
@@ -4581,7 +4991,7 @@ func main() {
 
 		if time.Now().Unix()-last_metrics_refresh_time > METRIC_DEFINITION_REFRESH_TIME {
 			//metrics
-			if fileBased {
+			if fileBasedMetrics {
 				metrics, err = ReadMetricsFromFolder(opts.MetricsFolder, first_loop)
 			} else {
 				metrics, err = ReadMetricDefinitionMapFromPostgres(first_loop)
@@ -4594,7 +5004,7 @@ func main() {
 			}
 		}
 
-		if fileBased || adHocMode {
+		if fileBasedMetrics {
 			pmc, err := ReadPresetMetricsConfigFromFolder(opts.MetricsFolder, false)
 			if err != nil {
 				if first_loop {
@@ -4679,9 +5089,9 @@ func main() {
 		}
 
 		if first_loop && (len(monitored_dbs) == 0 || len(metric_def_map) == 0) {
-			log.Warningf("host info refreshed, nr. of enabled hosts in configuration: %d, nr. of distinct metrics: %d", len(monitored_dbs), len(metric_def_map))
+			log.Warningf("host info refreshed, nr. of enabled entries in configuration: %d, nr. of distinct metrics: %d", len(monitored_dbs), len(metric_def_map))
 		} else {
-			log.Infof("host info refreshed, nr. of enabled hosts in configuration: %d, nr. of distinct metrics: %d", len(monitored_dbs), len(metric_def_map))
+			log.Infof("host info refreshed, nr. of enabled entries in configuration: %d, nr. of distinct metrics: %d", len(monitored_dbs), len(metric_def_map))
 		}
 
 		if first_loop {
@@ -4878,6 +5288,7 @@ func main() {
 				time.Sleep(time.Second * 1)
 			}
 		}
+
 		// loop over existing channels and stop workers if DB or metric removed from config
 		log.Debug("checking if any workers need to be shut down...")
 		control_channel_list := make([]string, len(control_channels))
@@ -4888,36 +5299,61 @@ func main() {
 		}
 		gatherers_shut_down := 0
 
-	next_chan:
 		for _, db_metric := range control_channel_list {
+			var currentMetricConfig map[string]float64
+			var dbInfo MonitoredDatabase
+			var ok, dbRemovedFromConfig bool
+			singleMetricDisabled := false
 			splits := strings.Split(db_metric, ":")
 			db := splits[0]
 			metric := splits[1]
+			//log.Debugf("Checking if need to shut down worker for [%s:%s]...", db, metric)
 
-			_, ok := hostsToShutDownDueToRoleChange[db]
-
-			if !ok { // maybe some single metric was disabled
-				for _, host := range monitored_dbs {
-					if host.DBUniqueName == db {
-						metricConfig := metric_config
-
-						for metric_key := range metricConfig {
-							if metric_key == metric && metricConfig[metric_key] > 0 {
-								continue next_chan
-							}
-						}
-					}
+			_, wholeDbShutDownDueToRoleChange := hostsToShutDownDueToRoleChange[db]
+			if !wholeDbShutDownDueToRoleChange {
+				monitored_db_cache_lock.RLock()
+				dbInfo, ok = monitored_db_cache[db]
+				monitored_db_cache_lock.RUnlock()
+				if !ok { // normal removing of DB from config
+					dbRemovedFromConfig = true
+					log.Debugf("DB %s removed from config, shutting down all metric worker processes...", db)
 				}
 			}
-			log.Infof("shutting down gatherer for [%s:%s] ...", db, metric)
-			control_channels[db_metric] <- ControlMessage{Action: GATHERER_STATUS_STOP}
-			delete(control_channels, db_metric)
-			log.Debugf("control channel for [%s:%s] deleted", db, metric)
-			gatherers_shut_down++
+
+			if !(wholeDbShutDownDueToRoleChange || dbRemovedFromConfig) { // maybe some single metric was disabled
+				db_pg_version_map_lock.RLock()
+				verInfo, ok := db_pg_version_map[db]
+				db_pg_version_map_lock.RUnlock()
+				if !ok {
+					log.Warningf("Could not find PG version info for DB %s, skipping shutdown check of metric worker process for %s", db, metric)
+					continue
+				}
+
+				if verInfo.IsInRecovery && len(dbInfo.MetricsStandby) > 0 {
+					currentMetricConfig = dbInfo.MetricsStandby
+				} else {
+					currentMetricConfig = dbInfo.Metrics
+				}
+
+				interval, isMetricActive := currentMetricConfig[metric]
+				if !isMetricActive || interval <= 0 {
+					singleMetricDisabled = true
+				}
+			}
+
+			if wholeDbShutDownDueToRoleChange || dbRemovedFromConfig || singleMetricDisabled {
+				log.Infof("shutting down gatherer for [%s:%s] ...", db, metric)
+				control_channels[db_metric] <- ControlMessage{Action: GATHERER_STATUS_STOP}
+				delete(control_channels, db_metric)
+				log.Debugf("control channel for [%s:%s] deleted", db, metric)
+				gatherers_shut_down++
+				ClearDBUnreachableStateIfAny(db)
+			}
 		}
 		if gatherers_shut_down > 0 {
 			log.Warningf("sent STOP message to %d gatherers (it might take some minutes for them to stop though)", gatherers_shut_down)
 		}
+
 		log.Debugf("main sleeping %ds...", opts.ServersRefreshLoopSeconds)
 		time.Sleep(time.Second * time.Duration(opts.ServersRefreshLoopSeconds))
 	}

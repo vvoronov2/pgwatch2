@@ -10,6 +10,63 @@ or a specific version
 
 ```docker run -d -p 3000:3000 -p 8080:8080 --name pw2 cybertec/pgwatch2:x.y.z```
 
+## Notice on updating old setups
+
+When migrating existing "config DB" based setups, all previous schema migration diffs with bigger version numbers need to be
+applied first from the "pgwatch2/sql/config_store/migrations/" (or /etc/pgwatch2/sql/config_store/migrations/ if using
+ther pre-built packages) folder. Also it is highly recommended to refresh all the metric definitions as they're constantly improved.
+For that there's also a refresh_metrics_from_github.sh script provided. YAML based setups don't need any extra actions besides
+refreshing from Git or installing the new RPM / DEB / Tar packages.
+
+## v1.8.4 [2021-02-12]
+
+Main changes:
+
+* TimescaleDB metric storage - cope with v2.0 breaking API changes and improve indexing.
+* New gatherer feature - ability to extract "psutil_*" metrics (CPU, disk usage etc) directly from OS. Use "--direct-os-stats" parameter to enable.
+* Gatherer improvement - make Graphite storage connections more resilient. @eshkinkot
+* Gatherer improvement - add number of total monitored and currently unreachable databases to the stats port output.
+* Metrics - introduce a new 'instance_up' metric with values \[0|1\] to help with SLA type "uptime percentage" calculations.
+* Metrics - correct wal_receiver.replay_lag_b datatype to int8. @eshkinkot
+* Metrics - 'replication' now supports also cascaded setups as pg_stat_replication has actually data on "cascading primaries".
+* Dashboards - on PG "Alert template" dash replace DB based "Available connections" with "Instance connections used %".
+* Docker - give Grafana some more time to roll out its DB schema migrations.
+* Docker - introduce an explicit supervisord startup script to better time the startup sequence (5s pauses between components).
+* Docker - component update to InfluxDB 1.8.4, Grafana 6.7.5, Go 1.5.8.
+* Docker - limit Python PIP to pre v21 versions as it was breaking the build.
+* K8s / Openshift - more and better Helm chart templates.
+
+
+## v1.8.3 [2020-12-23]
+
+Main changes:
+
+* Gatherer fix - avoid unnecessary internal restarts of metrics gathering introduced in v1.8.1. Was causing much bigger metric data volumes than usual.
+
+
+## v1.8.2 [2020-12-22]
+
+Main changes:
+
+* Gatherer fix - avoid unnecessary internal restarts of metrics gathering introduced in v1.8.1. Was causing much bigger metric volumes than usual.
+* Metrics fix - remove "spill_bytes" from v13 "replication" metric as it didn't make it into the final Postgres release.
+* New feature - support automatic monitoring of whole Patroni "namespaces" with DB type "patroni-namespace-discovery". NB! Only when "etcd" is used as DCS.
+* New dashboard - "Table details time lag" to visually compare table access pattern from two time ranges.
+* Gatherer improvement - do not connect to config DB in adhoc mode as it's not really not needed.
+* Gatherer improvement - add "totalMetricFetchFailuresCounter" to the Stats / Health-check port output.
+* Postgres metrics DB - try per-table dropping of old data partitions first, to reduce the chance of running out of locks.
+* Web UI improvement - don't require the InfluxDB driver when using Postgres metrics storage.
+* Web UI - "stats-summary" page corrections. Note that the page is only for quick verification that metrics are being gathered and deprecated.
+* Metrics DB - correct a typo in the TimescaleDB rollout script.
+* Metrics - add new metric + helper 'vmstat'.
+* Metric helpers - more secure helpers, removing SECURITY DEFINER where not critically needed
+* Dashboards - "DB Overview": replace "CPU load" which is not available with tup_fetched vs tup_returned ratio.
+* Docker component update - Go 1.15.6.
+
+This release added 1 SQL diff to be applied for Config DB based setups:
+https://github.com/cybertec-postgresql/pgwatch2/blob/master/pgwatch2/sql/config_store/migrations/v1.8.2-1_patroni_namespace_discovery.sql
+
+
 ## v1.8.1 [2020-10-22]
 
 Main changes:

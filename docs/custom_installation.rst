@@ -68,7 +68,7 @@ All examples here assume Ubuntu as OS - but it's basically the same for RedHat f
           git clone https://github.com/cybertec-postgresql/pgwatch2.git
           cd pgwatch2
           ./build_gatherer.sh
-          # after fetcing all the Go library dependencies (can take minutes)
+          # after fetching all the Go library dependencies (can take minutes)
           # an executable named "pgwatch2" should be generated ...
 
     * Configure a SystemD auto-start service (optional)
@@ -124,9 +124,9 @@ All examples here assume Ubuntu as OS - but it's basically the same for RedHat f
       ::
 
         cd /etc/pgwatch2/sql/metric_store
-        psql -f roll_out_metric_time.sql pgwatch2_metrics
+        psql -f roll_out_metric_time.psql pgwatch2_metrics
 
-      **NB! Default retention for Postgres storage is 2 weeks!** To change, use the ``--pg-retention-days / PW2_RETENTION_DAYS`` gatherer parameter.
+      **NB! Default retention for Postgres storage is 2 weeks!** To change, use the ``--pg-retention-days / PW2_PG_RETENTION_DAYS`` gatherer parameter.
 
 #. **Prepare the "to-be-monitored" databases for metrics collection**
 
@@ -151,7 +151,8 @@ All examples here assume Ubuntu as OS - but it's basically the same for RedHat f
          # first we need Python 3 and "pip" - the Python package manager
          sudo apt install python3 python3-pip
          cd /etc/pgwatch2/webpy/
-         sudo pip3 install -U -r webpy/requirements.txt
+         sudo pip3 install -U -r requirements_pg_metrics.txt
+         # NB! Replace with "requirements_influx_metrics.txt" if using InfluxDB to store metrics
 
    #. Exposing component logs (optional)
 
@@ -183,7 +184,7 @@ All examples here assume Ubuntu as OS - but it's basically the same for RedHat f
 
 #. **Start the pgwatch2 metrics collection agent**
 
-   #. The gatherer has quite some parameters (use the *--help* flag to show them all), but simplest form would be:
+   #. The gatherer has quite some parameters (use the *\-\-help* flag to show them all), but simplest form would be:
 
       ::
 
@@ -195,6 +196,7 @@ All examples here assume Ubuntu as OS - but it's basically the same for RedHat f
           --verbose=info
 
         # or via SystemD if set up in step #2
+        useradd -m -s /bin/bash pgwatch2 # default SystemD templates run under the pgwatch2 user
         sudo systemctl start pgwatch2
         sudo systemctl status pgwatch2
 

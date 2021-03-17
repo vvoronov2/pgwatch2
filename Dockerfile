@@ -2,7 +2,7 @@ FROM ubuntu:16.04
 
 RUN apt-get -q update \
     && apt-get -qy install wget apt-transport-https vim git postgresql postgresql-plpython3-9.5 postgresql-plpython-9.5 libfontconfig python3-pip python-pip libssl-dev libpq-dev \
-    && pip install -U pip && pip3 install -U pip \
+    && pip install -U "pip < 21.0" && pip3 install -U "pip < 21.0" \
     && locale-gen "en_US.UTF-8" && apt autoremove -y \
     && pg_dropcluster 9.5 main ; pg_createcluster --locale en_US.UTF-8 9.5 main \
     && echo "include = 'pgwatch_postgresql.conf'" >> /etc/postgresql/9.5/main/postgresql.conf
@@ -13,8 +13,8 @@ RUN apt-get -q update \
 # Influxdb [https://portal.influxdata.com/downloads]
 #   latest ver.: curl -so- https://api.github.com/repos/influxdata/influxdb/tags | grep -Eo '"v[0-9\.]+"' | grep -Eo '[0-9\.]+' | sort -nr | head -1
 
-RUN wget -q -O grafana.deb https://dl.grafana.com/oss/release/grafana_6.7.4_amd64.deb \
-    && wget -q -O - https://dl.influxdata.com/influxdb/releases/influxdb_1.8.3_amd64.deb > influxdb_amd64.deb \
+RUN wget -q -O grafana.deb https://dl.grafana.com/oss/release/grafana_6.7.5_amd64.deb \
+    && wget -q -O - https://dl.influxdata.com/influxdb/releases/influxdb_1.8.4_amd64.deb > influxdb_amd64.deb \
     && dpkg -i grafana.deb && rm grafana.deb \
     && dpkg -i influxdb_amd64.deb && rm influxdb_amd64.deb \
     && sed -i 's/\# query-log-enabled = true/query-log-enabled = false/' /etc/influxdb/influxdb.conf \
@@ -40,11 +40,11 @@ ENV GIT_TIME=${GIT_TIME}
 
 # Go installation [https://golang.org/dl/]
 # Grafana config customizations, Web UI requirements, compilation of the Go gatherer
-RUN wget -q -O /tmp/go.tar.gz https://dl.google.com/go/go1.15.3.linux-amd64.tar.gz \
+RUN wget -q -O /tmp/go.tar.gz https://dl.google.com/go/go1.15.8.linux-amd64.tar.gz \
     && tar -C /usr/local -xzf /tmp/go.tar.gz \
     && export PATH=$PATH:/usr/local/go/bin \
     && cp /pgwatch2/bootstrap/grafana_custom_config.ini /etc/grafana/grafana.ini \
-    && pip3 install -r /pgwatch2/webpy/requirements.txt \
+    && pip3 install -r /pgwatch2/webpy/requirements_influx_metrics.txt \
     && pip2 install psutil \
     && echo "$GIT_HASH" > /pgwatch2/build_git_version.txt \
     && cd /pgwatch2 && bash build_gatherer.sh \

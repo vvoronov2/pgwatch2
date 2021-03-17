@@ -24,7 +24,7 @@ comment on table admin.metrics_template is 'used as a template for all new metri
 
 -- create index on admin.metrics_template using brin (dbname, time);  /* consider BRIN instead for large data amounts */
 create index on admin.metrics_template (dbname, time);
-create index on admin.metrics_template using gin (dbname, tag_data, time) where tag_data notnull;
+create index on admin.metrics_template using gin (tag_data) where tag_data notnull;
 
 /*
  something like below will be done by the gatherer AUTOMATICALLY via the admin.ensure_partition_timescale() function:
@@ -39,6 +39,8 @@ ALTER TABLE some_metric SET (
 );
 
 SELECT add_compress_chunks_policy('some_metric', INTERVAL '1 day');
+-- for Timescale v2.0+:
+-- PERFORM add_compression_policy('some_metric', INTERVAL '1 day');
 
 */
 

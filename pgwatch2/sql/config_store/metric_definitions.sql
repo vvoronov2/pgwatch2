@@ -1191,22 +1191,22 @@ $sql$
 
 /* replication */
 
-insert into pgwatch2.metric(m_name, m_pg_version_from, m_master_only, m_sql, m_column_attrs, m_sql_su)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs, m_sql_su)
 values (
 'replication',
 9.2,
-true,
 $sql$
 SELECT
   (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
   application_name as tag_application_name,
   concat(coalesce(client_addr::text, client_hostname), '_', client_port::text) as tag_client_info,
-  coalesce(pg_xlog_location_diff(pg_current_xlog_location(), write_location)::int8, 0) as write_lag_b,
-  coalesce(pg_xlog_location_diff(pg_current_xlog_location(), flush_location)::int8, 0) as flush_lag_b,
-  coalesce(pg_xlog_location_diff(pg_current_xlog_location(), replay_location)::int8, 0) as replay_lag_b,
+  coalesce(pg_xlog_location_diff(case when pg_is_in_recovery() then pg_last_xlog_receive_location() else pg_current_xlog_location() end, write_location)::int8, 0) as write_lag_b,
+  coalesce(pg_xlog_location_diff(case when pg_is_in_recovery() then pg_last_xlog_receive_location() else pg_current_xlog_location() end, flush_location)::int8, 0) as flush_lag_b,
+  coalesce(pg_xlog_location_diff(case when pg_is_in_recovery() then pg_last_xlog_receive_location() else pg_current_xlog_location() end, replay_location)::int8, 0) as replay_lag_b,
   state,
   sync_state,
-  case when sync_state in ('sync', 'quorum') then 1 else 0 end as is_sync_int
+  case when sync_state in ('sync', 'quorum') then 1 else 0 end as is_sync_int,
+  case when pg_is_in_recovery() then 1 else 0 end as in_recovery_int
 from
   get_stat_replication();
 $sql$,
@@ -1216,35 +1216,36 @@ SELECT
   (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
   application_name as tag_application_name,
   concat(coalesce(client_addr::text, client_hostname), '_', client_port::text) as tag_client_info,
-  coalesce(pg_xlog_location_diff(pg_current_xlog_location(), write_location)::int8, 0) as write_lag_b,
-  coalesce(pg_xlog_location_diff(pg_current_xlog_location(), flush_location)::int8, 0) as flush_lag_b,
-  coalesce(pg_xlog_location_diff(pg_current_xlog_location(), replay_location)::int8, 0) as replay_lag_b,
+  coalesce(pg_xlog_location_diff(case when pg_is_in_recovery() then pg_last_xlog_receive_location() else pg_current_xlog_location() end, write_location)::int8, 0) as write_lag_b,
+  coalesce(pg_xlog_location_diff(case when pg_is_in_recovery() then pg_last_xlog_receive_location() else pg_current_xlog_location() end, flush_location)::int8, 0) as flush_lag_b,
+  coalesce(pg_xlog_location_diff(case when pg_is_in_recovery() then pg_last_xlog_receive_location() else pg_current_xlog_location() end, replay_location)::int8, 0) as replay_lag_b,
   state,
   sync_state,
-  case when sync_state in ('sync', 'quorum') then 1 else 0 end as is_sync_int
+  case when sync_state in ('sync', 'quorum') then 1 else 0 end as is_sync_int,
+  case when pg_is_in_recovery() then 1 else 0 end as in_recovery_int
 from
-  pg_stat_replication
+  pg_stat_replication;
 $sql$
 );
 
 /* replication */
 
-insert into pgwatch2.metric(m_name, m_pg_version_from, m_master_only, m_sql, m_column_attrs)
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
 values (
 'replication',
 10,
-true,
 $sql$
 SELECT
   (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
   application_name as tag_application_name,
   concat(coalesce(client_addr::text, client_hostname), '_', client_port::text) as tag_client_info,
-  coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn)::int8, 0) as write_lag_b,
-  coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn)::int8, 0) as flush_lag_b,
-  coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::int8, 0) as replay_lag_b,
+  coalesce(pg_wal_lsn_diff(case when pg_is_in_recovery() then pg_last_wal_receive_lsn() else pg_current_wal_lsn() end, write_lsn)::int8, 0) as write_lag_b,
+  coalesce(pg_wal_lsn_diff(case when pg_is_in_recovery() then pg_last_wal_receive_lsn() else pg_current_wal_lsn() end, flush_lsn)::int8, 0) as flush_lag_b,
+  coalesce(pg_wal_lsn_diff(case when pg_is_in_recovery() then pg_last_wal_receive_lsn() else pg_current_wal_lsn() end, replay_lsn)::int8, 0) as replay_lag_b,
   state,
   sync_state,
-  case when sync_state in ('sync', 'quorum') then 1 else 0 end as is_sync_int
+  case when sync_state in ('sync', 'quorum') then 1 else 0 end as is_sync_int,
+  case when pg_is_in_recovery() then 1 else 0 end as in_recovery_int
 from
   /* NB! when the query fails, grant "pg_monitor" system role (exposing all stats) to the monitoring user
      or create specifically the "get_stat_replication" helper and use that instead of pg_stat_replication
@@ -1821,200 +1822,296 @@ values (
 'stat_statements',
 9.2,
 $sql$
-with q_data as (
-  select
-    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
-    (regexp_replace(md5(query), E'\\D', '', 'g'))::varchar(10)::int8 as tag_queryid,
-    max(ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g')))::varchar(16000) as tag_query,
-    array_to_string(array_agg(distinct quote_ident(pg_get_userbyid(userid))), ',') as users,
-    sum(s.calls)::int8 as calls,
-    round(sum(s.total_time)::numeric, 3)::double precision as total_time,
-    sum(shared_blks_hit)::int8 as shared_blks_hit,
-    sum(shared_blks_read)::int8 as shared_blks_read,
-    sum(shared_blks_written)::int8 as shared_blks_written,
-    sum(shared_blks_dirtied)::int8 as shared_blks_dirtied,
-    sum(temp_blks_read)::int8 as temp_blks_read,
-    sum(temp_blks_written)::int8 as temp_blks_written,
-    round(sum(blk_read_time)::numeric, 3)::double precision as blk_read_time,
-    round(sum(blk_write_time)::numeric, 3)::double precision as blk_write_time
-  from
-    get_stat_statements() s
-  where
-    calls > 5
-    and total_time > 0
-    and dbid = (select oid from pg_database where datname = current_database())
-    and not upper(s.query) like any (array['DEALLOCATE%', 'SET %', 'RESET %', 'BEGIN%', 'BEGIN;',
-      'COMMIT%', 'END%', 'ROLLBACK%', 'SHOW%'])
-  group by
-    tag_queryid
-)
-select * from (
-  select
+WITH q_data AS (
+    SELECT
+        (extract(epoch FROM now()) * 1e9)::int8 AS epoch_ns,
+        (regexp_replace(md5(query::varchar(1000)), E'\\D', '', 'g'))::varchar(10)::text as tag_queryid,
+        /*
+         NB! if security conscious about exposing query texts replace the below expression with a dash ('-') OR
+         use the stat_statements_no_query_text metric instead, created specifically for this use case.
+         */
+        array_to_string(array_agg(DISTINCT quote_ident(pg_get_userbyid(userid))), ',') AS users,
+        sum(s.calls)::int8 AS calls,
+        round(sum(s.total_time)::numeric, 3)::double precision AS total_time,
+        sum(shared_blks_hit)::int8 AS shared_blks_hit,
+        sum(shared_blks_read)::int8 AS shared_blks_read,
+        sum(shared_blks_written)::int8 AS shared_blks_written,
+        sum(shared_blks_dirtied)::int8 AS shared_blks_dirtied,
+        sum(temp_blks_read)::int8 AS temp_blks_read,
+        sum(temp_blks_written)::int8 AS temp_blks_written,
+        round(sum(blk_read_time)::numeric, 3)::double precision AS blk_read_time,
+        round(sum(blk_write_time)::numeric, 3)::double precision AS blk_write_time
+    FROM
+        get_stat_statements() s
+    WHERE
+        calls > 5
+        AND total_time > 5
+        AND dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database())
+            AND NOT upper(s.query::varchar(50))
+            LIKE ANY (ARRAY['DEALLOCATE%',
+                'SET %',
+                'RESET %',
+                'BEGIN%',
+                'BEGIN;',
+                'COMMIT%',
+                'END%',
+                'ROLLBACK%',
+                'SHOW%'])
+        GROUP BY
+            tag_queryid
+),
+q_queryid_text AS (
+    SELECT
+        (regexp_replace(md5(query::varchar(1000)), E'\\D', '', 'g'))::varchar(10)::text as queryid,
+        query::varchar(8000)
+    FROM
+        get_stat_statements()
+    WHERE
+        dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database()))
+SELECT
+    b.*,
+    (
+        SELECT
+            ltrim(regexp_replace(query, E'[ \\t\\n\\r]+', ' ', 'g'))
+        FROM
+            q_queryid_text
+        WHERE
+            q_queryid_text.queryid = b.tag_queryid
+        LIMIT 1) AS tag_query
+FROM (
+    SELECT
+        *
+    FROM (
+        SELECT
+            *
+        FROM
+            q_data
+        WHERE
+            total_time > 0
+        ORDER BY
+            total_time DESC
+        LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    total_time > 0
-  order by
-    total_time desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    ORDER BY
+        calls DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  order by
-    calls desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_read > 0
+    ORDER BY
+        shared_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_read > 0
-  order by
-    shared_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_written > 0
+    ORDER BY
+        shared_blks_written DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_written > 0
-  order by
-    shared_blks_written desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_read > 0
+    ORDER BY
+        temp_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    temp_blks_read > 0
-  order by
-    temp_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
-    *
-  from
-    q_data
-  where
-    temp_blks_written > 0
-  order by
-    temp_blks_written desc
-  limit 100
-) a;
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_written > 0
+    ORDER BY
+        temp_blks_written DESC
+    LIMIT 100) a) b;
 $sql$,
 $sql$
-with q_data as (
-  select
-    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
-    (regexp_replace(md5(query), E'\\D', '', 'g'))::varchar(10)::int8 as tag_queryid,
-    max(ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g')))::varchar(16000) as tag_query,
-    array_to_string(array_agg(distinct quote_ident(pg_get_userbyid(userid))), ',') as users,
-    sum(s.calls)::int8 as calls,
-    round(sum(s.total_time)::numeric, 3)::double precision as total_time,
-    sum(shared_blks_hit)::int8 as shared_blks_hit,
-    sum(shared_blks_read)::int8 as shared_blks_read,
-    sum(shared_blks_written)::int8 as shared_blks_written,
-    sum(shared_blks_dirtied)::int8 as shared_blks_dirtied,
-    sum(temp_blks_read)::int8 as temp_blks_read,
-    sum(temp_blks_written)::int8 as temp_blks_written,
-    round(sum(blk_read_time)::numeric, 3)::double precision as blk_read_time,
-    round(sum(blk_write_time)::numeric, 3)::double precision as blk_write_time
-  from
-    pg_stat_statements s
-  where
-    calls > 5
-    and total_time > 0
-    and dbid = (select oid from pg_database where datname = current_database())
-    and not upper(s.query) like any (array['DEALLOCATE%', 'SET %', 'RESET %', 'BEGIN%', 'BEGIN;',
-      'COMMIT%', 'END%', 'ROLLBACK%', 'SHOW%'])
-  group by
-    tag_queryid
-)
-select * from (
-  select
+WITH q_data AS (
+    SELECT
+        (extract(epoch FROM now()) * 1e9)::int8 AS epoch_ns,
+        (regexp_replace(md5(query::varchar(1000)), E'\\D', '', 'g'))::varchar(10)::text as tag_queryid,
+        /*
+         NB! if security conscious about exposing query texts replace the below expression with a dash ('-') OR
+         use the stat_statements_no_query_text metric instead, created specifically for this use case.
+         */
+        array_to_string(array_agg(DISTINCT quote_ident(pg_get_userbyid(userid))), ',') AS users,
+        sum(s.calls)::int8 AS calls,
+        round(sum(s.total_time)::numeric, 3)::double precision AS total_time,
+        sum(shared_blks_hit)::int8 AS shared_blks_hit,
+        sum(shared_blks_read)::int8 AS shared_blks_read,
+        sum(shared_blks_written)::int8 AS shared_blks_written,
+        sum(shared_blks_dirtied)::int8 AS shared_blks_dirtied,
+        sum(temp_blks_read)::int8 AS temp_blks_read,
+        sum(temp_blks_written)::int8 AS temp_blks_written,
+        round(sum(blk_read_time)::numeric, 3)::double precision AS blk_read_time,
+        round(sum(blk_write_time)::numeric, 3)::double precision AS blk_write_time
+    FROM
+        pg_stat_statements s
+    WHERE
+        calls > 5
+        AND total_time > 5
+        AND dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database())
+            AND NOT upper(s.query::varchar(50))
+            LIKE ANY (ARRAY['DEALLOCATE%',
+                'SET %',
+                'RESET %',
+                'BEGIN%',
+                'BEGIN;',
+                'COMMIT%',
+                'END%',
+                'ROLLBACK%',
+                'SHOW%'])
+        GROUP BY
+            tag_queryid
+),
+q_queryid_text AS (
+    SELECT
+        (regexp_replace(md5(query::varchar(1000)), E'\\D', '', 'g'))::varchar(10)::text as queryid,
+        query::varchar(8000)
+    FROM
+        pg_stat_statements
+    WHERE
+        dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database()))
+SELECT
+    b.*,
+    (
+        SELECT
+            ltrim(regexp_replace(query, E'[ \\t\\n\\r]+', ' ', 'g'))
+        FROM
+            q_queryid_text
+        WHERE
+            q_queryid_text.queryid = b.tag_queryid
+        LIMIT 1) AS tag_query
+FROM (
+    SELECT
+        *
+    FROM (
+        SELECT
+            *
+        FROM
+            q_data
+        WHERE
+            total_time > 0
+        ORDER BY
+            total_time DESC
+        LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    total_time > 0
-  order by
-    total_time desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    ORDER BY
+        calls DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  order by
-    calls desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_read > 0
+    ORDER BY
+        shared_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_read > 0
-  order by
-    shared_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_written > 0
+    ORDER BY
+        shared_blks_written DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_written > 0
-  order by
-    shared_blks_written desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_read > 0
+    ORDER BY
+        temp_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    temp_blks_read > 0
-  order by
-    temp_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
-    *
-  from
-    q_data
-  where
-    temp_blks_written > 0
-  order by
-    temp_blks_written desc
-  limit 100
-) a;
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_written > 0
+    ORDER BY
+        temp_blks_written DESC
+    LIMIT 100) a) b;
 $sql$
 );
 
@@ -2023,200 +2120,296 @@ values (
 'stat_statements',
 9.4,
 $sql$
-with q_data as (
-  select
-    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
-    queryid::text as tag_queryid,
-    max(ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g')))::varchar(16000) as tag_query,
-    array_to_string(array_agg(distinct quote_ident(pg_get_userbyid(userid))), ',') as users,
-    sum(s.calls)::int8 as calls,
-    round(sum(s.total_time)::numeric, 3)::double precision as total_time,
-    sum(shared_blks_hit)::int8 as shared_blks_hit,
-    sum(shared_blks_read)::int8 as shared_blks_read,
-    sum(shared_blks_written)::int8 as shared_blks_written,
-    sum(shared_blks_dirtied)::int8 as shared_blks_dirtied,
-    sum(temp_blks_read)::int8 as temp_blks_read,
-    sum(temp_blks_written)::int8 as temp_blks_written,
-    round(sum(blk_read_time)::numeric, 3)::double precision as blk_read_time,
-    round(sum(blk_write_time)::numeric, 3)::double precision as blk_write_time
-  from
-    get_stat_statements() s
-  where
-    calls > 5
-    and total_time > 0
-    and dbid = (select oid from pg_database where datname = current_database())
-    and not upper(s.query) like any (array['DEALLOCATE%', 'SET %', 'RESET %', 'BEGIN%', 'BEGIN;',
-      'COMMIT%', 'END%', 'ROLLBACK%', 'SHOW%'])
-  group by
-    queryid
-)
-select * from (
-  select
+WITH q_data AS (
+    SELECT
+        (extract(epoch FROM now()) * 1e9)::int8 AS epoch_ns,
+        queryid::text AS tag_queryid,
+        /*
+         NB! if security conscious about exposing query texts replace the below expression with a dash ('-') OR
+         use the stat_statements_no_query_text metric instead, created specifically for this use case.
+         */
+        array_to_string(array_agg(DISTINCT quote_ident(pg_get_userbyid(userid))), ',') AS users,
+        sum(s.calls)::int8 AS calls,
+        round(sum(s.total_time)::numeric, 3)::double precision AS total_time,
+        sum(shared_blks_hit)::int8 AS shared_blks_hit,
+        sum(shared_blks_read)::int8 AS shared_blks_read,
+        sum(shared_blks_written)::int8 AS shared_blks_written,
+        sum(shared_blks_dirtied)::int8 AS shared_blks_dirtied,
+        sum(temp_blks_read)::int8 AS temp_blks_read,
+        sum(temp_blks_written)::int8 AS temp_blks_written,
+        round(sum(blk_read_time)::numeric, 3)::double precision AS blk_read_time,
+        round(sum(blk_write_time)::numeric, 3)::double precision AS blk_write_time
+    FROM
+        get_stat_statements() s
+    WHERE
+        calls > 5
+        AND total_time > 5
+        AND dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database())
+            AND NOT upper(s.query::varchar(50))
+            LIKE ANY (ARRAY['DEALLOCATE%',
+                'SET %',
+                'RESET %',
+                'BEGIN%',
+                'BEGIN;',
+                'COMMIT%',
+                'END%',
+                'ROLLBACK%',
+                'SHOW%'])
+        GROUP BY
+            queryid
+),
+q_queryid_text AS (
+    SELECT
+        queryid::text,
+        query::varchar(8000)
+    FROM
+        get_stat_statements()
+    WHERE
+        dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database()))
+SELECT
+    b.*,
+    (
+        SELECT
+            ltrim(regexp_replace(query, E'[ \\t\\n\\r]+', ' ', 'g'))
+        FROM
+            q_queryid_text
+        WHERE
+            q_queryid_text.queryid = b.tag_queryid
+        LIMIT 1) AS tag_query
+FROM (
+    SELECT
+        *
+    FROM (
+        SELECT
+            *
+        FROM
+            q_data
+        WHERE
+            total_time > 0
+        ORDER BY
+            total_time DESC
+        LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    total_time > 0
-  order by
-    total_time desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    ORDER BY
+        calls DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  order by
-    calls desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_read > 0
+    ORDER BY
+        shared_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_read > 0
-  order by
-    shared_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_written > 0
+    ORDER BY
+        shared_blks_written DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_written > 0
-  order by
-    shared_blks_written desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_read > 0
+    ORDER BY
+        temp_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    temp_blks_read > 0
-  order by
-    temp_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
-    *
-  from
-    q_data
-  where
-    temp_blks_written > 0
-  order by
-    temp_blks_written desc
-  limit 100
-) a;
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_written > 0
+    ORDER BY
+        temp_blks_written DESC
+    LIMIT 100) a) b;
 $sql$,
 $sql$
-with q_data as (
-  select
-    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
-    queryid::text as tag_queryid,
-    max(ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g')))::varchar(16000) as tag_query,
-    array_to_string(array_agg(distinct quote_ident(pg_get_userbyid(userid))), ',') as users,
-    sum(s.calls)::int8 as calls,
-    round(sum(s.total_time)::numeric, 3)::double precision as total_time,
-    sum(shared_blks_hit)::int8 as shared_blks_hit,
-    sum(shared_blks_read)::int8 as shared_blks_read,
-    sum(shared_blks_written)::int8 as shared_blks_written,
-    sum(shared_blks_dirtied)::int8 as shared_blks_dirtied,
-    sum(temp_blks_read)::int8 as temp_blks_read,
-    sum(temp_blks_written)::int8 as temp_blks_written,
-    round(sum(blk_read_time)::numeric, 3)::double precision as blk_read_time,
-    round(sum(blk_write_time)::numeric, 3)::double precision as blk_write_time
-  from
-    pg_stat_statements s
-  where
-    calls > 5
-    and total_time > 0
-    and dbid = (select oid from pg_database where datname = current_database())
-    and not upper(s.query) like any (array['DEALLOCATE%', 'SET %', 'RESET %', 'BEGIN%', 'BEGIN;',
-      'COMMIT%', 'END%', 'ROLLBACK%', 'SHOW%'])
-  group by
-    queryid
-)
-select * from (
-  select
+WITH q_data AS (
+    SELECT
+        (extract(epoch FROM now()) * 1e9)::int8 AS epoch_ns,
+        queryid::text AS tag_queryid,
+        /*
+         NB! if security conscious about exposing query texts replace the below expression with a dash ('-') OR
+         use the stat_statements_no_query_text metric instead, created specifically for this use case.
+         */
+        array_to_string(array_agg(DISTINCT quote_ident(pg_get_userbyid(userid))), ',') AS users,
+        sum(s.calls)::int8 AS calls,
+        round(sum(s.total_time)::numeric, 3)::double precision AS total_time,
+        sum(shared_blks_hit)::int8 AS shared_blks_hit,
+        sum(shared_blks_read)::int8 AS shared_blks_read,
+        sum(shared_blks_written)::int8 AS shared_blks_written,
+        sum(shared_blks_dirtied)::int8 AS shared_blks_dirtied,
+        sum(temp_blks_read)::int8 AS temp_blks_read,
+        sum(temp_blks_written)::int8 AS temp_blks_written,
+        round(sum(blk_read_time)::numeric, 3)::double precision AS blk_read_time,
+        round(sum(blk_write_time)::numeric, 3)::double precision AS blk_write_time
+    FROM
+        pg_stat_statements s
+    WHERE
+        calls > 5
+        AND total_time > 5
+        AND dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database())
+            AND NOT upper(s.query::varchar(50))
+            LIKE ANY (ARRAY['DEALLOCATE%',
+                'SET %',
+                'RESET %',
+                'BEGIN%',
+                'BEGIN;',
+                'COMMIT%',
+                'END%',
+                'ROLLBACK%',
+                'SHOW%'])
+        GROUP BY
+            queryid
+),
+q_queryid_text AS (
+    SELECT
+        queryid::text,
+        query::varchar(8000)
+    FROM
+        pg_stat_statements
+    WHERE
+        dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database()))
+SELECT
+    b.*,
+    (
+        SELECT
+            ltrim(regexp_replace(query, E'[ \\t\\n\\r]+', ' ', 'g'))
+        FROM
+            q_queryid_text
+        WHERE
+            q_queryid_text.queryid = b.tag_queryid
+        LIMIT 1) AS tag_query
+FROM (
+    SELECT
+        *
+    FROM (
+        SELECT
+            *
+        FROM
+            q_data
+        WHERE
+            total_time > 0
+        ORDER BY
+            total_time DESC
+        LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    total_time > 0
-  order by
-    total_time desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    ORDER BY
+        calls DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  order by
-    calls desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_read > 0
+    ORDER BY
+        shared_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_read > 0
-  order by
-    shared_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_written > 0
+    ORDER BY
+        shared_blks_written DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_written > 0
-  order by
-    shared_blks_written desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_read > 0
+    ORDER BY
+        temp_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    temp_blks_read > 0
-  order by
-    temp_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
-    *
-  from
-    q_data
-  where
-    temp_blks_written > 0
-  order by
-    temp_blks_written desc
-  limit 100
-) a;
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_written > 0
+    ORDER BY
+        temp_blks_written DESC
+    LIMIT 100) a) b;
 $sql$
 );
 
@@ -2226,206 +2419,302 @@ values (
 'stat_statements',
 13,
 $sql$
-with q_data as (
-  select
-    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
-    queryid::text as tag_queryid,
-    max(ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g')))::varchar(16000) as tag_query,
-    array_to_string(array_agg(distinct quote_ident(pg_get_userbyid(userid))), ',') as users,
-    sum(s.calls)::int8 as calls,
-    round(sum(s.total_exec_time)::numeric, 3)::double precision as total_time,
-    sum(shared_blks_hit)::int8 as shared_blks_hit,
-    sum(shared_blks_read)::int8 as shared_blks_read,
-    sum(shared_blks_written)::int8 as shared_blks_written,
-    sum(shared_blks_dirtied)::int8 as shared_blks_dirtied,
-    sum(temp_blks_read)::int8 as temp_blks_read,
-    sum(temp_blks_written)::int8 as temp_blks_written,
-    round(sum(blk_read_time)::numeric, 3)::double precision as blk_read_time,
-    round(sum(blk_write_time)::numeric, 3)::double precision as blk_write_time,
-    sum(wal_fpi)::int8 as wal_fpi,
-    sum(wal_bytes)::int8 as wal_bytes,
-    round(sum(s.total_plan_time)::numeric, 3)::double precision as total_plan_time
-  from
-    get_stat_statements() s
-  where
-    calls > 5
-    and total_exec_time > 0
-    and dbid = (select oid from pg_database where datname = current_database())
-    and not upper(s.query) like any (array['DEALLOCATE%', 'SET %', 'RESET %', 'BEGIN%', 'BEGIN;',
-      'COMMIT%', 'END%', 'ROLLBACK%', 'SHOW%'])
-  group by
-    queryid
-)
-select * from (
-  select
+WITH q_data AS (
+    SELECT
+        (extract(epoch FROM now()) * 1e9)::int8 AS epoch_ns,
+        queryid::text AS tag_queryid,
+        /*
+         NB! if security conscious about exposing query texts replace the below expression with a dash ('-') OR
+         use the stat_statements_no_query_text metric instead, created specifically for this use case.
+         */
+        array_to_string(array_agg(DISTINCT quote_ident(pg_get_userbyid(userid))), ',') AS users,
+        sum(s.calls)::int8 AS calls,
+        round(sum(s.total_exec_time)::numeric, 3)::double precision AS total_time,
+        sum(shared_blks_hit)::int8 AS shared_blks_hit,
+        sum(shared_blks_read)::int8 AS shared_blks_read,
+        sum(shared_blks_written)::int8 AS shared_blks_written,
+        sum(shared_blks_dirtied)::int8 AS shared_blks_dirtied,
+        sum(temp_blks_read)::int8 AS temp_blks_read,
+        sum(temp_blks_written)::int8 AS temp_blks_written,
+        round(sum(blk_read_time)::numeric, 3)::double precision AS blk_read_time,
+        round(sum(blk_write_time)::numeric, 3)::double precision AS blk_write_time,
+        sum(wal_fpi)::int8 AS wal_fpi,
+        sum(wal_bytes)::int8 AS wal_bytes,
+        round(sum(s.total_plan_time)::numeric, 3)::double precision AS total_plan_time
+    FROM
+        get_stat_statements() s
+    WHERE
+        calls > 5
+        AND total_exec_time > 5
+        AND dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database())
+            AND NOT upper(s.query::varchar(50))
+            LIKE ANY (ARRAY['DEALLOCATE%',
+                'SET %',
+                'RESET %',
+                'BEGIN%',
+                'BEGIN;',
+                'COMMIT%',
+                'END%',
+                'ROLLBACK%',
+                'SHOW%'])
+        GROUP BY
+            queryid
+),
+q_queryid_text AS (
+    SELECT
+        queryid::text,
+        query::varchar(8000)
+    FROM
+        get_stat_statements()
+    WHERE
+        dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database()))
+SELECT
+    b.*,
+    (
+        SELECT
+            ltrim(regexp_replace(query, E'[ \\t\\n\\r]+', ' ', 'g'))
+        FROM
+            q_queryid_text
+        WHERE
+            q_queryid_text.queryid = b.tag_queryid
+        LIMIT 1) AS tag_query
+FROM (
+    SELECT
+        *
+    FROM (
+        SELECT
+            *
+        FROM
+            q_data
+        WHERE
+            total_time > 0
+        ORDER BY
+            total_time DESC
+        LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    total_time > 0
-  order by
-    total_time desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    ORDER BY
+        calls DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  order by
-    calls desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_read > 0
+    ORDER BY
+        shared_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_read > 0
-  order by
-    shared_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_written > 0
+    ORDER BY
+        shared_blks_written DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_written > 0
-  order by
-    shared_blks_written desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_read > 0
+    ORDER BY
+        temp_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    temp_blks_read > 0
-  order by
-    temp_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
-    *
-  from
-    q_data
-  where
-    temp_blks_written > 0
-  order by
-    temp_blks_written desc
-  limit 100
-) a;
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_written > 0
+    ORDER BY
+        temp_blks_written DESC
+    LIMIT 100) a) b;
 $sql$,
 $sql$
-with q_data as (
-  select
-    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
-    queryid::text as tag_queryid,
-    max(ltrim(regexp_replace(query, E'[ \\t\\n\\r]+' , ' ', 'g')))::varchar(16000) as tag_query,
-    array_to_string(array_agg(distinct quote_ident(pg_get_userbyid(userid))), ',') as users,
-    sum(s.calls)::int8 as calls,
-    round(sum(s.total_exec_time)::numeric, 3)::double precision as total_time,
-    sum(shared_blks_hit)::int8 as shared_blks_hit,
-    sum(shared_blks_read)::int8 as shared_blks_read,
-    sum(shared_blks_written)::int8 as shared_blks_written,
-    sum(shared_blks_dirtied)::int8 as shared_blks_dirtied,
-    sum(temp_blks_read)::int8 as temp_blks_read,
-    sum(temp_blks_written)::int8 as temp_blks_written,
-    round(sum(blk_read_time)::numeric, 3)::double precision as blk_read_time,
-    round(sum(blk_write_time)::numeric, 3)::double precision as blk_write_time,
-    sum(wal_fpi)::int8 as wal_fpi,
-    sum(wal_bytes)::int8 as wal_bytes,
-    round(sum(s.total_plan_time)::numeric, 3)::double precision as total_plan_time
-  from
-    pg_stat_statements s
-  where
-    calls > 5
-    and total_exec_time > 0
-    and dbid = (select oid from pg_database where datname = current_database())
-    and not upper(s.query) like any (array['DEALLOCATE%', 'SET %', 'RESET %', 'BEGIN%', 'BEGIN;',
-      'COMMIT%', 'END%', 'ROLLBACK%', 'SHOW%'])
-  group by
-    queryid
-)
-select * from (
-  select
+WITH q_data AS (
+    SELECT
+        (extract(epoch FROM now()) * 1e9)::int8 AS epoch_ns,
+        queryid::text AS tag_queryid,
+        /*
+         NB! if security conscious about exposing query texts replace the below expression with a dash ('-') OR
+         use the stat_statements_no_query_text metric instead, created specifically for this use case.
+         */
+        array_to_string(array_agg(DISTINCT quote_ident(pg_get_userbyid(userid))), ',') AS users,
+        sum(s.calls)::int8 AS calls,
+        round(sum(s.total_exec_time)::numeric, 3)::double precision AS total_time,
+        sum(shared_blks_hit)::int8 AS shared_blks_hit,
+        sum(shared_blks_read)::int8 AS shared_blks_read,
+        sum(shared_blks_written)::int8 AS shared_blks_written,
+        sum(shared_blks_dirtied)::int8 AS shared_blks_dirtied,
+        sum(temp_blks_read)::int8 AS temp_blks_read,
+        sum(temp_blks_written)::int8 AS temp_blks_written,
+        round(sum(blk_read_time)::numeric, 3)::double precision AS blk_read_time,
+        round(sum(blk_write_time)::numeric, 3)::double precision AS blk_write_time,
+        sum(wal_fpi)::int8 AS wal_fpi,
+        sum(wal_bytes)::int8 AS wal_bytes,
+        round(sum(s.total_plan_time)::numeric, 3)::double precision AS total_plan_time
+    FROM
+        pg_stat_statements s
+    WHERE
+        calls > 5
+        AND total_exec_time > 5
+        AND dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database())
+            AND NOT upper(s.query::varchar(50))
+            LIKE ANY (ARRAY['DEALLOCATE%',
+                'SET %',
+                'RESET %',
+                'BEGIN%',
+                'BEGIN;',
+                'COMMIT%',
+                'END%',
+                'ROLLBACK%',
+                'SHOW%'])
+        GROUP BY
+            queryid
+),
+q_queryid_text AS (
+    SELECT
+        queryid::text,
+        query::varchar(8000)
+    FROM
+        pg_stat_statements
+    WHERE
+        dbid = (
+            SELECT
+                oid
+            FROM
+                pg_database
+            WHERE
+                datname = current_database()))
+SELECT
+    b.*,
+    (
+        SELECT
+            ltrim(regexp_replace(query, E'[ \\t\\n\\r]+', ' ', 'g'))
+        FROM
+            q_queryid_text
+        WHERE
+            q_queryid_text.queryid = b.tag_queryid
+        LIMIT 1) AS tag_query
+FROM (
+    SELECT
+        *
+    FROM (
+        SELECT
+            *
+        FROM
+            q_data
+        WHERE
+            total_time > 0
+        ORDER BY
+            total_time DESC
+        LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    total_time > 0
-  order by
-    total_time desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    ORDER BY
+        calls DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  order by
-    calls desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_read > 0
+    ORDER BY
+        shared_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_read > 0
-  order by
-    shared_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        shared_blks_written > 0
+    ORDER BY
+        shared_blks_written DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    shared_blks_written > 0
-  order by
-    shared_blks_written desc
-  limit 100
-) a
-union
-select * from (
-  select
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_read > 0
+    ORDER BY
+        temp_blks_read DESC
+    LIMIT 100) a
+UNION
+SELECT
     *
-  from
-    q_data
-  where
-    temp_blks_read > 0
-  order by
-    temp_blks_read desc
-  limit 100
-) a
-union
-select * from (
-  select
-    *
-  from
-    q_data
-  where
-    temp_blks_written > 0
-  order by
-    temp_blks_written desc
-  limit 100
-) a;
+FROM (
+    SELECT
+        *
+    FROM
+        q_data
+    WHERE
+        temp_blks_written > 0
+    ORDER BY
+        temp_blks_written DESC
+    LIMIT 100) a) b;
 $sql$
 );
 
@@ -4535,7 +4824,7 @@ $$
 from os import getloadavg
 la = getloadavg()
 return [la[0], la[1], la[2]]
-$$ LANGUAGE plpython3u VOLATILE SECURITY DEFINER;
+$$ LANGUAGE plpython3u VOLATILE;
 
 GRANT EXECUTE ON FUNCTION get_load_average() TO pgwatch2;
 
@@ -4949,7 +5238,6 @@ CREATE OR REPLACE FUNCTION get_psutil_cpu(
     OUT "user" float8, OUT system float8, OUT idle float8, OUT iowait float8, OUT irqs float8, OUT other float8
 )
  LANGUAGE plpython3u
- SECURITY DEFINER
 AS $FUNCTION$
 
 from os import getloadavg
@@ -5014,7 +5302,6 @@ CREATE OR REPLACE FUNCTION get_psutil_mem(
 	OUT swap_total float8, OUT swap_used float8, OUT swap_free float8, OUT swap_percent float8
 )
  LANGUAGE plpython3u
- SECURITY DEFINER
 AS $FUNCTION$
 from psutil import virtual_memory, swap_memory
 vm = virtual_memory()
@@ -5148,7 +5435,6 @@ CREATE OR REPLACE FUNCTION get_psutil_disk_io_total(
 	OUT read_count float8, OUT write_count float8, OUT read_bytes float8, OUT write_bytes float8
 )
  LANGUAGE plpython3u
- SECURITY DEFINER
 AS $FUNCTION$
 from psutil import disk_io_counters
 dc = disk_io_counters(perdisk=False)
@@ -5271,7 +5557,7 @@ true,
 $sql$
 select
   (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
-  pg_xlog_location_diff(pg_last_xlog_receive_location(), pg_last_xlog_replay_location()) as replay_lag_b,
+  pg_xlog_location_diff(pg_last_xlog_receive_location(), pg_last_xlog_replay_location())::int8 as replay_lag_b,
   extract(epoch from (now() - pg_last_xact_replay_timestamp()))::int8 as last_replay_s;
 $sql$,
 '{"prometheus_all_gauge_columns": true}'
@@ -5285,7 +5571,7 @@ true,
 $sql$
 select
   (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
-  pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) as replay_lag_b,
+  pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())::int8 as replay_lag_b,
   extract(epoch from (now() - pg_last_xact_replay_timestamp()))::int8 as last_replay_s;
 $sql$,
 '{"prometheus_all_gauge_columns": true}'
@@ -6118,6 +6404,93 @@ where
 ;
 $sql$,
 '{"prometheus_all_gauge_columns": true}'
+);
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_comment, m_is_helper)
+values (
+'get_vmstat',
+9.1,
+$sql$
+/*
+  vmstat + some extra infos like CPU count, 1m/5m/15m load avg. and total memory
+  NB! Memory and disk info returned in bytes!
+*/
+
+CREATE EXTENSION IF NOT EXISTS plpython3u; /* NB! "plpython3u" might need changing to "plpythonu" (Python 2) everywhere for older OS-es */
+
+-- DROP FUNCTION get_vmstat(int);
+
+CREATE OR REPLACE FUNCTION get_vmstat(
+    IN delay int default 1,
+    OUT r int, OUT b int, OUT swpd int8, OUT free int8, OUT buff int8, OUT cache int8, OUT si int8, OUT so int8, OUT bi int8,
+    OUT bo int8, OUT "in" int, OUT cs int, OUT us int, OUT sy int, OUT id int, OUT wa int, OUT st int,
+    OUT cpu_count int, OUT load_1m float4, OUT load_5m float4, OUT load_15m float4, OUT total_memory int8
+)
+    LANGUAGE plpython3u
+AS $FUNCTION$
+    from os import cpu_count, popen
+    unit = 1024  # 'vmstat' default block byte size
+
+    cpu_count = cpu_count()
+    vmstat_lines = popen('vmstat {} 2'.format(delay)).readlines()
+    vm = [int(x) for x in vmstat_lines[-1].split()]
+    # plpy.notice(vm)
+    load_1m, load_5m, load_15m = None, None, None
+    with open('/proc/loadavg', 'r') as f:
+        la_line = f.readline()
+        if la_line:
+            splits = la_line.split()
+            if len(splits) == 5:
+                load_1m, load_5m, load_15m = splits[0], splits[1], splits[2]
+
+    total_memory = None
+    with open('/proc/meminfo', 'r') as f:
+        mi_line = f.readline()
+        splits = mi_line.split()
+        # plpy.notice(splits)
+        if len(splits) == 3:
+            total_memory = int(splits[1]) * 1024
+
+    return vm[0], vm[1], vm[2] * unit, vm[3] * unit, vm[4] * unit, vm[5] * unit, vm[6] * unit, vm[7] * unit, vm[8] * unit, \
+        vm[9] * unit, vm[10], vm[11], vm[12], vm[13], vm[14], vm[15], vm[16], cpu_count, load_1m, load_5m, load_15m, total_memory
+$FUNCTION$;
+
+GRANT EXECUTE ON FUNCTION get_vmstat(int) TO pgwatch2;
+COMMENT ON FUNCTION get_vmstat(int) IS 'created for pgwatch2';
+
+$sql$,
+'',
+true
+);
+
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_column_attrs)
+values (
+'vmstat',
+9.1,
+$sql$
+SELECT
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    r, b, swpd, free, buff, cache, si, so, bi, bo, "in", cs, us, sy, id, wa, st, cpu_count, load_1m, load_5m, load_15m, total_memory
+from
+    get_vmstat();
+$sql$,
+'{"prometheus_all_gauge_columns": true}'
+);
+
+
+insert into pgwatch2.metric(m_name, m_pg_version_from, m_sql, m_comment)
+values (
+'instance_up',
+9.0,
+$sql$
+select
+    (extract(epoch from now()) * 1e9)::int8 as epoch_ns,
+    1::int as is_up
+;
+$sql$,
+'NB! This metric has some special handling attached to it - it will store a 0 value if the DB is not accessible.
+Thus it can be used to for example calculate some percentual "uptime" indicator.'
 );
 
 

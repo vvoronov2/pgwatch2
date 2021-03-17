@@ -1,4 +1,4 @@
-![Docker Pulls](https://img.shields.io/docker/pulls/cybertec/pgwatch2)
+[![Docker Pulls](https://img.shields.io/docker/pulls/cybertec/pgwatch2-nonroot)](https://hub.docker.com/search?q=cybertec%20pgwatch2&type=image)
 
 # pgwatch2
 
@@ -14,7 +14,7 @@ Flexible self-contained PostgreSQL metrics monitoring/dashboarding solution. Sup
 
 # Quick Start
 
-For the fastest setup experience Docker images are provided via Docker Hub (for a Docker quickstart see
+For the fastest setup experience [Docker images](https://hub.docker.com/search?q=cybertec%20pgwatch2&type=image) are provided via Docker Hub (for a Docker quickstart see
 [here](https://docs.docker.com/get-started/)). For custom setups see the according [chapter](https://pgwatch2.readthedocs.io/en/latest/custom_installation.html)
 from documentation or turn to the "Releases" tab for pre-built DEB / RPM / Tar packages directly.
 
@@ -42,7 +42,7 @@ variables see [ENV_VARIABLES.md](https://github.com/cybertec-postgresql/pgwatch2
 * Intuitive metrics presentation using the Grafana dashboarding engine with optional Alerting
 * Lots of pre-configured dashboards and metric configurations covering all Statistics Collector data
 * Easy extensibility by defining metrics in pure SQL (thus they could also be from business domain)
-* 4 supported data stores for metrics storage (PostgreSQL, InfluxDB, Graphite, Prometheus)
+* 4 supported data stores for metrics storage (PostgreSQL with or without TimescaleDB, InfluxDB, Graphite, Prometheus)
 * Multiple configuration options (YAML, PostgreSQL, ENV) supporting both "push" and "pull" models
 * Possible to monitoring all or a subset of DBs of a PostgreSQL cluster
 * Global or DB level configuration of metrics/intervals
@@ -50,7 +50,7 @@ variables see [ENV_VARIABLES.md](https://github.com/cybertec-postgresql/pgwatch2
 * PgBouncer, Pgpool-II, AWS RDS and Patroni support
 * Internal health-check API to monitor metrics gathering status
 * Security options like SSL / HTTPS for all connections and password encryption for connect strings
-* Very low resource requirements for the collector even when monitoring hundreds of DBs
+* Very low resource requirements for the collector - 1 CPU core can handle ~3k monitored DBs at 1GB RAM usage
 * Log parsing capabilities when deployed locally in "push" mode
 
 # Component diagram for the default Docker setup
@@ -69,6 +69,18 @@ Two most common deployment options are:
 
 ![Component diagram](https://raw.githubusercontent.com/cybertec-postgresql/pgwatch2/master/screenshots/pgwatch2_architecture_push.png)
 
+# Metrics storage options
+
+For storing metrics collected by the pgwatch2 daemon there are quite some options available:
+
+* PostgreSQL - v11+ recommended. Multiple storage partitioning layouts available depending on the amount of servers to be monitored.
+* PostgreSQL with the TimescaleDB extension - offers good compression and generally recommended when monitoring 100+ databases.
+* InfluxDB - Time-Series optimized database. Note that the newly released v2.0 is not yet supported. Good Grafana integration but quite limited query language.
+* Prometheus - here the pgwatch2 daemon would not store anything directly but just expose an endpoint for remote scraping / storage via Prometheus.
+* Graphite - legacy support for Graphite. Not recommended anymore for new installations as it does not support the "tag" system.
+
+See the [documentation](https://pgwatch2.readthedocs.io/en/latest/components.html?highlight=timescale#metrics-storage-db) for more details.
+
 # Steps to configure your database for monitoring
 
 As a base requirement you'll need a login user (non-superuser suggested) for connecting to your PostgreSQL servers and fetching metrics queries.
@@ -81,6 +93,8 @@ CREATE ROLE pgwatch2 WITH LOGIN PASSWORD 'secret';
 -- account used for monitoring can only open a limited number of connections (there are according checks in code also though)
 ALTER ROLE pgwatch2 CONNECTION LIMIT 3;
 GRANT pg_monitor TO pgwatch2;   -- system role available for v10+ servers to reduce superuser usage
+GRANT CONNECT ON DATABASE mydb TO pgwatch2;
+GRANT USAGE ON SCHEMA public TO pgwatch2; -- NB! pgwatch doesn't necessarily require using the public schema though!
 ```
 
 Additionally, for extra insights on "to be monitored" databases, it's recommended to install and activate the [pg_stat_statement](https://www.postgresql.org/docs/12/pgstatstatements.html)
@@ -91,18 +105,21 @@ parameter in server configuration.
 
 If for security reasons a plain unprivileged database account is used for metrics gathering, this would mean that some
 protected PostgreSQL internal statistics cannot be fetched. This might be just OK (there's also an "unprivileged" preset),
-but it's also possible to expose such protected information in a safe and controlled way via a set of predefined SECURITY DEFINER functions.
+but it's also possible to expose such protected information in a safe and controlled way via a set of predefined SECURITY
+DEFINER functions. Note that another way to expose most of the protected metrics for Postgres v10+ instances would be to
+grant the special "pg_monitor" system role to the monitoring user like in the above paragraph.
 
 To be executed on the "to be monitored" database:
 
 ```
-psql -h mydb.com -U superuser -f /etc/pgwatch2/metrics/00_helpers/$pgver/get_stat_activity/$pgver/metric.sql mydb
+psql -h mydb.com -U superuser -f /etc/pgwatch2/metrics/00_helpers/get_stat_activity/$pgver/metric.sql mydb
 psql -h mydb.com -U superuser -f /etc/pgwatch2/metrics/00_helpers/get_stat_statements/$pgver/metric.sql mydb
 psql -h mydb.com -U superuser -f /etc/pgwatch2/metrics/00_helpers/get_stat_replication/$pgver/metric.sql mydb
 ```
 
 NB! By default the "helpers" assume that a role called "pgwatch2" will be used for metrics gathering. If not so, you need
-to change the SQL definitions.
+to change the SQL definitions. Also note that some helper scripts can refuse to install if the security of the target
+schema is too "open" for everyone (i.e. to the built-in "public" meta-role) and thus there's potential for misuse.
 
 ## Integration of OS level metrics
 
@@ -177,19 +194,20 @@ In this mode the pgwatch2 agents should be running on all database hosts separat
 possible though, it would counter the core idea of Prometheus and would make scrapes also longer, risking timeouts.
 There's also a separate "Preset Config" named "prometheus". More [details](https://pgwatch2.readthedocs.io/en/latest/installation_options.html#prometheus-mode).
 
-# Kubernetes / Helm
+# Kubernetes / OpenShift / Helm
 
-Cloud deployments of pgwatch2 should be no problem - there are some simple K8s deployment templates provided and also a
-Helm chart in the "openshift_k8s" [folder](https://github.com/cybertec-postgresql/pgwatch2/tree/master/openshift_k8s).
+Cloud deployments of pgwatch2 should be no problem - there are some simple deployment templates provided and also some
+Helm charts in the "openshift_k8s" [folder](https://github.com/cybertec-postgresql/pgwatch2/tree/master/openshift_k8s).
 
-Helm setup values should be reviewed / edited in `./openshift_k8s/helm-chart`, whereas installation is done by the following command:
+NB! Helm setup values should always be reviewed / edited as the defaults are rather for testing purposes. Installation
+is done by the following command:
 
 ```shell script
 cd openshift_k8s
-helm install ./helm-chart --name pgwatch2 -f chart-values.yml
+helm install -f chart-values-k8s-pg-storage.yml pgwatch2 helm-chart-k8s-pg-storage
 ``` 
 
-Please have a look at `openshift_k8s/helm-chart/values.yaml` to get additional information of configurable options.
+Please have a look at the according (K8s or OpenShift) `values.yaml` files to get additional information of configurable options.
 
 # Contributing
 

@@ -315,7 +315,13 @@
       "hideTimeOverride": true,
       "id": 44,
       "interval": null,
-      "links": [],
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "Postgres Version Overview",
+          "url": "/dashboard/db/postgres-version-overview?$__all_variables"
+        }
+      ],
       "mappingType": 1,
       "mappingTypes": [
         {
@@ -2781,6 +2787,7 @@
       "interval": null,
       "links": [
         {
+          "targetBlank": true,
           "title": "\"Index overview\" dashboard",
           "url": "/dashboard/db/index-overview"
         }
@@ -3452,7 +3459,7 @@
         {
           "targetBlank": true,
           "title": "DB overview",
-          "url": "/dashboard/db/db-overview?$__all_variables&panelId=9&fullscreen"
+          "url": "/dashboard/db/db-overview?$__all_variables&panelId=19&fullscreen"
         }
       ],
       "mappingType": 1,
@@ -4960,7 +4967,7 @@
       "valueName": "current"
     },
     {
-      "content": "Brought to you by: <a href=\"https://www.cybertec-postgresql.com/en/\"><img src=\"https://www.cybertec-postgresql.com/wp-content/uploads/2019/05/Cybertec_Logo_wei%C3%9F-transparent_300x80px-01.png\" alt=\"Cybertec – The PostgreSQL Database Company\"></a>",
+      "content": "Brought to you by: <a href=\"https://www.cybertec-postgresql.com/en/\"><img src=\"https://www.cybertec-postgresql.com/wp-content/uploads/2020/11/CYBERTEC_RGB_300x80px.png\" alt=\"Cybertec – The PostgreSQL Database Company\"></a>",
       "gridPos": {
         "h": 4,
         "w": 12,

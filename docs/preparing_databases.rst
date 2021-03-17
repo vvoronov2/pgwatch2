@@ -35,6 +35,9 @@ SQL scripts (see below for explanation) accordingly, as in those by default the 
   -- (there are according checks in code, but multiple instances might be launched)
   ALTER ROLE pgwatch2 CONNECTION LIMIT 3;
   GRANT pg_monitor TO pgwatch2;   // v10+
+  GRANT CONNECT ON DATABASE mydb TO pgwatch2;
+  GRANT USAGE ON SCHEMA public TO pgwatch2; -- NB! pgwatch doesn't necessarily require using the public schema though!
+  GRANT EXECUTE ON FUNCTION pg_stat_file(text) to pgwatch2; -- needed by the wal_size metric
 
 For most monitored databases it's extremely beneficial (to troubleshooting performance issues) to also activate the
 `pg\_stat\_statements <https://www.postgresql.org/docs/current/pgstatstatements.html>`__ extension which will give us exact "per query" performance aggregates and also enables to calculate
@@ -72,7 +75,8 @@ metrics (like active session details, "per query" statistics) or even OS-level m
 monitoring role.
 
 If using a superuser login (recommended only for local "push" setups) you have full access to
-all Postgres metrics and would need *helpers* only for OS statistics (as of pgwatch2 version 1.6.0).
+all Postgres metrics and would need *helpers* only for OS remote statistics. For local (push) setups as of pgwatch2 version
+1.8.4 the most typical OS metrics are covered by the "--direct-os-stats" flag, explained below.
 
 For unprivileged monitoring users it is highly recommended to take these additional steps on the "to be monitored"
 database to get maximum value out of pgwatch2 in the long run. Without these additional steps, you lose though about
@@ -95,8 +99,12 @@ For completely unprivileged monitoring users the following *helpers* are recomme
   psql -f /etc/pgwatch2/metrics/00_helpers/get_wal_size/$pgver/metric.sql mydb
   psql -f /etc/pgwatch2/metrics/00_helpers/get_stat_statements/$pgver/metric.sql mydb
 
-NB! Note that there might not be an exact Postgres version match for helper definitions - then replace *$pgver* with the next
-available version number above your server's Postgres version number.
+NB! Note that there might not be an exact Postgres version match for helper definitions - then replace *$pgver* with the previous
+available version number below your server's Postgres version number.
+
+NB! Also note that as of v1.8.1 some helpers definition SQL-s scripts (like for "get_stat_statements") will inspect also
+the "search_path" and by default **will not install into schemas that have PUBLIC CREATE privileges**, like the "public"
+schema by default has!
 
 Also when rolling out helpers make sure the `search_path` is at defaults or set so that it's also accessible for the monitoring role
 as currently neither helpers nor metric definition SQL-s don't assume any particualar schema and depend on the `search_path` including everything needed.
@@ -133,7 +141,8 @@ running on. This is a good thing for portability but can be somewhat limiting fo
 To overcome this problem, users can also choose to install *helpers* extracting OS metrics like CPU, RAM usage, etc so that this
 data is stored together with Postgres-native metrics for easier graphing / correlation / alerting. This also enable to be totally independent
 of any System Monitoring tools like Zabbix, etc, with the downside that everything is gathered over Postgres connections so that
-when Postgres is down no OS metrics can be gathered also.
+when Postgres is down no OS metrics can be gathered also. Since v1.8.4 though the latter problem can be reduced for local
+"push" based setups via the "--direct-os-stats" option plus according metrics configuration (e.g. the "full" preset).
 
 Note though that PL/Python is usually disabled by DB-as-a-service providers like AWS RDS for security reasons.
 
@@ -171,6 +180,11 @@ Notice on using metric fetching helpers
   version used, so small adjustments might be needed there (e.g. to remove a non-existent column). Minimum usable Kernel version
   required is 3.3. Also note that SQL helpers functions are currently defined for Python 3, so for older Python 2 you need
   to change the ``LANGUAGE plpython3u`` part.
+
+* When running the gatherer locally, i.e. having a "push" based configuration, the metric fetching helpers are not mostly
+  not needed as superuser can be used in a safe way and starting from v1.8.4 one can also enable the **--direct-os-stats**
+  parameter to signal that we can fetch the data for the default "psutil_*" metrics directly from OS counters. If direct
+  OS fetching fails though, the fallback is still to try via PL/Python wrappers.
 
 * In rare cases when some "helpers" have been installed, and when doing a binary PostgreSQL upgrade at some later point in time via `pg_upgrade`, this could result in
   error messages thrown. Then just drop those failing helpers on the "to be upgraded" cluster and re-create them after the upgrade process.
